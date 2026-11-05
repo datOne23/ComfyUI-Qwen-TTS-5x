@@ -57,6 +57,32 @@ LANGUAGE_MAP = {
     "Italian": "italian",
 }
 
+# Inline emotion tag map: tag -> detailed instruct spoken to the model.
+# Mirrors ComfyUI-Qwen3-TTS/nodes.py EMOTION_MAP.
+EMOTION_MAP = {
+    # English
+    "happy": "Speak in a happy and cheerful tone, full of energy.",
+    "angry": "Speak with an angry and stern tone, aggressive and sharp.",
+    "sad": "Speak in a sad, low-spirited voice with a hint of sorrow.",
+    "whisper": "Speak in a very soft whisper, as if sharing a secret.",
+    "fearful": "Speak with a trembling, terrified voice, sounding panic-stricken.",
+    "surprised": "Speak with a shocked and incredulous tone, pitch raised.",
+    "disgusted": "Speak with a tone of revulsion and strong dislike.",
+    "neutral": "Speak in a natural, calm, and steady tone.",
+    # Chinese
+    "开心": "用愉快、开心的语气说话，充满活力和阳光。",
+    "激动": "语气非常激动，语速稍快，充满兴奋感。",
+    "生气": "用愤怒、严厉的语气说话，语调生硬且带有攻击性。",
+    "难过": "语气低沉、忧伤，带有明显的哀伤和哭腔感。",
+    "温柔": "声音轻柔、温婉，充满爱意和关怀。",
+    "恐惧": "声音颤抖，语气惊恐不安，呼吸感加重。",
+    "冷酷": "语气冰冷、没有任何情感波动，显得疏离而机械。",
+    "低语": "用极小的声音说话，像是在耳边轻声细语，充满神秘感。",
+    "惊讶": "语气充满震惊和不可思议，音调上扬，带有明显的意外感。",
+    "厌恶": "语气充满嫌弃和反感，带有不屑和排斥的情感。",
+    "平静": "语气平稳自然，没有明显的情绪波动，清晰且沉稳。",
+}
+
 # Model family options for UI (0.6B / 1.7B)
 MODEL_FAMILIES = ["0.6B", "1.7B"]
 # Mapping of family to default HuggingFace repo ID
@@ -445,6 +471,97 @@ def split_text_by_pauses(text: str, config: Dict[str, float]) -> List[Tuple[str,
         segments.append((current_segment_text.strip(), 0.0))
         
     return segments
+
+
+def parse_text_with_inline_tags(text: str) -> List[Tuple[str, Union[str, float]]]:
+    """
+    Split text into segments based on inline [pause:X] / [p:X] tags.
+    Returns: List of (seg_type, content) where seg_type is "text" or "pause".
+    Pause tags are removed from the spoken text and turned into silence by the caller.
+    """
+    if not text:
+        return [("text", "")]
+
+    segments: List[Tuple[str, Union[str, float]]] = []
+    pause_pattern = re.compile(r"\[(?:pause|p):(\d+(?:\.\d+)?)(?:ms)?\]", re.IGNORECASE)
+
+    for line in str(text).split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        last_idx = 0
+        for match in pause_pattern.finditer(line):
+            text_part = line[last_idx:match.start()].strip()
+            if text_part:
+                segments.append(("text", text_part))
+            try:
+                duration = float(match.group(1))
+                segments.append(("pause", duration))
+            except ValueError:
+                pass
+            last_idx = match.end()
+        remaining = line[last_idx:].strip()
+        if remaining:
+            segments.append(("text", remaining))
+
+    if not segments:
+        segments.append(("text", text.strip()))
+    return segments
+
+
+def extract_emotion_instruct(text: str, base_instruct: Optional[str] = None) -> Tuple[str, Optional[str]]:
+    """
+    Extract inline emotion tags like [happy] or [开心] from text.
+    Returns (clean_text, combined_instruct_or_None).
+    Tags are removed from the spoken text and converted into a detailed instruct.
+    """
+    tags = re.findall(r"\[([^\]]+)\]", text)
+    clean_text = re.sub(r"\[([^\]]+)\]", "", text).strip()
+    emotion_instruct = None
+    if tags:
+        fragments = []
+        for t in tags:
+            if t in EMOTION_MAP:
+                fragments.append(EMOTION_MAP[t])
+            else:
+                # Pass through custom descriptive tags as-is; the model
+                # understands natural-language instructs directly.
+                fragments.append(t)
+        emotion_instruct = " ".join(fragments)
+    combined = None
+    parts = [p for p in [base_instruct, emotion_instruct] if p]
+    if parts:
+        combined = " ".join(parts)
+    return clean_text, combined
+
+
+def _render_segments(segments: List[Tuple[str, Union[str, float]]], render_one, default_sr: int = 24000) -> Dict[str, Any]:
+    """
+    Render ("text", content) / ("pause", duration) segments into one ComfyUI audio dict.
+    render_one(text: str) -> (np.ndarray waveform, int sr)
+    Returns {"waveform": torch.Tensor [1, 1, N], "sample_rate": sr}.
+    """
+    audio_results = []
+    sr = default_sr
+    for seg_type, content in segments:
+        if seg_type == "pause":
+            if content and float(content) > 0:
+                audio_results.append(np.zeros(int(float(content) * sr), dtype=np.float32))
+        else:
+            wav, seg_sr = render_one(content)
+            sr = seg_sr
+            if isinstance(wav, torch.Tensor):
+                wav = wav.cpu().numpy()
+            wav = np.asarray(wav, dtype=np.float32)
+            wav = np.squeeze(wav)
+            while wav.ndim > 1:
+                wav = np.mean(wav, axis=0)
+            audio_results.append(np.ravel(wav))
+    if not audio_results:
+        raise RuntimeError("No audio generated from inline tag segments.")
+    full = np.concatenate(audio_results)
+    waveform = torch.from_numpy(full).float().unsqueeze(0).unsqueeze(0)
+    return {"waveform": waveform, "sample_rate": int(sr)}
 
 
 def unload_cached_model(cache_key=None):
@@ -1027,7 +1144,7 @@ class VoiceDesignNode:
     def INPUT_TYPES(cls) -> Dict[str, Any]:
         return {
             "required": {
-                "text": ("STRING", {"multiline": True, "default": "Hello world", "placeholder": "Enter text to synthesize"}),
+                "text": ("STRING", {"multiline": True, "default": "Hello [pause:0.5] world. [happy] This is cheerful!", "placeholder": "Enter text to synthesize"}),
                 "instruct": ("STRING", {"multiline": True, "default": "", "placeholder": "Style instruction (required for VoiceDesign)"}),
                 "model_choice": (["0.6B", "1.7B"], {"default": "1.7B"}),
                 "device": (["auto", "cuda","mps", "cpu"], {"default": "auto"}),
@@ -1077,37 +1194,35 @@ class VoiceDesignNode:
         pbar.phase_loaded()
 
         mapped_lang = LANGUAGE_MAP.get(language, "auto")
+        instruct_arg = instruct if instruct and instruct.strip() else None
+
+        segments = parse_text_with_inline_tags(text)
 
         pbar.register()
-        wavs, sr = model.generate_voice_design(
-            text=text,
-            language=mapped_lang,
-            instruct=instruct,
-            max_new_tokens=max_new_tokens,
-            top_p=top_p,
-            top_k=top_k,
-            temperature=temperature,
-            repetition_penalty=repetition_penalty,
-        )
+
+        def render_design(text_content: str):
+            clean_text, combined_instruct = extract_emotion_instruct(text_content, instruct_arg)
+            wavs, seg_sr = model.generate_voice_design(
+                text=[clean_text],
+                language=mapped_lang,
+                instruct=combined_instruct,
+                max_new_tokens=max_new_tokens,
+                top_p=top_p,
+                top_k=top_k,
+                temperature=temperature,
+                repetition_penalty=repetition_penalty,
+            )
+            return wavs[0], seg_sr
+
+        audio_data = _render_segments(segments, render_design)
 
         pbar.phase_done()
         pbar.unregister()
 
-        if isinstance(wavs, list) and len(wavs) > 0:
-            waveform = torch.from_numpy(wavs[0]).float()
-            if waveform.ndim == 1:
-                waveform = waveform.unsqueeze(0).unsqueeze(0)
-            elif waveform.ndim == 2:
-                waveform = waveform.unsqueeze(0)
+        if unload_model_after_generate and hasattr(model, '_unload_callback') and model._unload_callback:
+            model._unload_callback()
 
-            audio_data = {"waveform": waveform, "sample_rate": sr}
-
-            if unload_model_after_generate and hasattr(model, '_unload_callback') and model._unload_callback:
-                model._unload_callback()
-
-            return (audio_data,)
-
-        raise RuntimeError("Invalid audio data generated")
+        return (audio_data,)
 
 
 class VoiceCloneNode:
@@ -1119,7 +1234,7 @@ class VoiceCloneNode:
     def INPUT_TYPES(cls) -> Dict[str, Any]:
         return {
             "required": {
-                "target_text": ("STRING", {"multiline": True, "default": "Good one. Okay, fine, I'm just gonna leave this sock monkey here. Goodbye."}),
+                "target_text": ("STRING", {"multiline": True, "default": "Good one. [pause:0.5] Okay, fine, I'm just gonna leave this sock monkey here. Goodbye."}),
                 "model_choice": (["0.6B", "1.7B"], {"default": "0.6B"}),
                 "device": (["auto", "cuda","mps", "cpu"], {"default": "auto"}),
                 "precision": (["bf16", "fp32"], {"default": "bf16"}),
@@ -1274,54 +1389,52 @@ class VoiceCloneNode:
             else:
                 raise RuntimeError("Unsupported reference audio format")
 
-        try:
-            mapped_lang = LANGUAGE_MAP.get(language, "auto")
+            try:
+                mapped_lang = LANGUAGE_MAP.get(language, "auto")
 
-            voice_clone_prompt_param = None
-            ref_audio_param = None
-            if voice_clone_prompt is not None:
-                voice_clone_prompt_param = voice_clone_prompt
-            elif ref_audio is not None:
-                ref_audio_param = audio_tuple
-            else:
-                raise RuntimeError("Either 'ref_audio' or 'voice_clone_prompt' must be provided")
+                voice_clone_prompt_param = None
+                ref_audio_param = None
+                if voice_clone_prompt is not None:
+                    voice_clone_prompt_param = voice_clone_prompt
+                elif ref_audio is not None:
+                    ref_audio_param = audio_tuple
+                else:
+                    raise RuntimeError("Either 'ref_audio' or 'voice_clone_prompt' must be provided")
 
-            pbar.register()
-            wavs, sr = model.generate_voice_clone(
-                text=target_text,
-                language=mapped_lang,
-                ref_audio=ref_audio_param,
-                ref_text=ref_text if ref_text and ref_text.strip() else None,
-                voice_clone_prompt=voice_clone_prompt_param,
-                x_vector_only_mode=x_vector_only,
-                max_new_tokens=max_new_tokens,
-                top_p=top_p,
-                top_k=top_k,
-                temperature=temperature,
-                repetition_penalty=repetition_penalty,
-            )
+                segments = parse_text_with_inline_tags(target_text)
 
-        except Exception as e:
-            raise RuntimeError(f"Generation failed: {e}")
+                pbar.register()
 
-        pbar.phase_done()
-        pbar.unregister()
+                def render_clone(text_content: str):
+                    clean_text, combined_instruct = extract_emotion_instruct(text_content, None)
+                    wavs, seg_sr = model.generate_voice_clone(
+                        text=[clean_text],
+                        language=mapped_lang,
+                        ref_audio=ref_audio_param,
+                        ref_text=ref_text if ref_text and ref_text.strip() else None,
+                        voice_clone_prompt=voice_clone_prompt_param,
+                        x_vector_only_mode=x_vector_only,
+                        instruct=[combined_instruct] if combined_instruct else None,
+                        max_new_tokens=max_new_tokens,
+                        top_p=top_p,
+                        top_k=top_k,
+                        temperature=temperature,
+                        repetition_penalty=repetition_penalty,
+                    )
+                    return wavs[0], seg_sr
 
-        if isinstance(wavs, list) and len(wavs) > 0:
-            waveform = torch.from_numpy(wavs[0]).float()
-            if waveform.ndim == 1:
-                waveform = waveform.unsqueeze(0).unsqueeze(0)
-            elif waveform.ndim == 2:
-                waveform = waveform.unsqueeze(0)
+                audio_data = _render_segments(segments, render_clone)
 
-            audio_data = {"waveform": waveform, "sample_rate": sr}
+            except Exception as e:
+                raise RuntimeError(f"Generation failed: {e}")
+
+            pbar.phase_done()
+            pbar.unregister()
 
             if unload_model_after_generate and hasattr(model, '_unload_callback') and model._unload_callback:
                 model._unload_callback()
 
             return (audio_data,)
-
-        raise RuntimeError("Invalid audio data generated")
 
 
 class CustomVoiceNode:
@@ -1333,7 +1446,7 @@ class CustomVoiceNode:
     def INPUT_TYPES(cls) -> Dict[str, Any]:
         return {
             "required": {
-                "text": ("STRING", {"multiline": True, "default": "Hello world", "placeholder": "Enter text to synthesize"}),
+                "text": ("STRING", {"multiline": True, "default": "Hello [pause:0.5] world. [happy] This is cheerful!", "placeholder": "Enter text to synthesize"}),
                 "speaker": (["Aiden", "Dylan", "Eric", "Ono_anna", "Ryan", "Serena", "Sohee", "Uncle_fu", "Vivian"], {"default": "Ryan"}),
                 "model_choice": (["0.6B", "1.7B"], {"default": "1.7B"}),
                 "device": (["auto", "cuda","mps", "cpu"], {"default": "auto"}),
@@ -1401,38 +1514,36 @@ class CustomVoiceNode:
         pbar.phase_loaded()
 
         mapped_lang = LANGUAGE_MAP.get(language, "auto")
+        instruct_arg = instruct if instruct and instruct.strip() else None
+
+        segments = parse_text_with_inline_tags(text)
 
         pbar.register()
-        wavs, sr = model.generate_custom_voice(
-            text=text,
-            language=mapped_lang,
-            speaker=target_speaker,
-            instruct=instruct if instruct and instruct.strip() else None,
-            max_new_tokens=max_new_tokens,
-            top_p=top_p,
-            top_k=top_k,
-            temperature=temperature,
-            repetition_penalty=repetition_penalty,
-        )
+
+        def render_custom(text_content: str):
+            clean_text, combined_instruct = extract_emotion_instruct(text_content, instruct_arg)
+            wavs, seg_sr = model.generate_custom_voice(
+                text=[clean_text],
+                language=[mapped_lang],
+                speaker=target_speaker,
+                instruct=[combined_instruct] if combined_instruct else None,
+                max_new_tokens=max_new_tokens,
+                top_p=top_p,
+                top_k=top_k,
+                temperature=temperature,
+                repetition_penalty=repetition_penalty,
+            )
+            return wavs[0], seg_sr
+
+        audio_data = _render_segments(segments, render_custom)
 
         pbar.phase_done()
         pbar.unregister()
 
-        if isinstance(wavs, list) and len(wavs) > 0:
-            waveform = torch.from_numpy(wavs[0]).float()
-            if waveform.ndim == 1:
-                waveform = waveform.unsqueeze(0).unsqueeze(0)
-            elif waveform.ndim == 2:
-                waveform = waveform.unsqueeze(0)
+        if unload_model_after_generate and hasattr(model, '_unload_callback') and model._unload_callback:
+            model._unload_callback()
 
-            audio_data = {"waveform": waveform, "sample_rate": sr}
-
-            if unload_model_after_generate and hasattr(model, '_unload_callback') and model._unload_callback:
-                model._unload_callback()
-
-            return (audio_data,)
-
-        raise RuntimeError("Invalid audio data generated")
+        return (audio_data,)
 
 
 class VoiceClonePromptNode:
