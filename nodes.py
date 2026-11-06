@@ -483,8 +483,10 @@ def _load_w8a8_model_fast(model_dir: str, w8a8_path: str, device="cuda",
     print(f"🚀 [Qwen3-TTS] w8a8 fast: loading int8 weights from {w8a8_path}")
     state_dict = load_file(w8a8_path, device="cpu")
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    missing_list = missing.missing_keys if hasattr(missing, "missing_keys") else missing
+    unexpected_list = unexpected.unexpected_keys if hasattr(unexpected, "unexpected_keys") else unexpected
     print(f"🔧 [Qwen3-TTS] w8a8 fast: {len(state_dict)} tensors loaded, "
-          f"missing={len(missing.missing_keys)}, unexpected={len(unexpected)}")
+          f"missing={len(missing_list)}, unexpected={len(unexpected_list)}")
 
     # 5. Move to device/dtype
     model = model.to(dtype=dtype).to(device)
