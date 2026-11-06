@@ -54,6 +54,19 @@ def _load_model_with_int8(source, **kwargs):
     """Load model with bitsandbytes int8 (dict_keys deepcopy handled via dispatch table)."""
     return Qwen3TTSModel.from_pretrained(source, **kwargs)
 
+
+def _load_int8_model(source, int8_source, **kwargs):
+    """Load model with bitsandbytes int8, optionally overriding with saved state dict."""
+    model = _load_model_with_int8(source, **kwargs)
+    if int8_source:
+        try:
+            state_dict = torch.load(os.path.join(int8_source, "pytorch_model.bin"), map_location="cpu")
+            model.model.load_state_dict(state_dict)
+            print(f"🔧 [Qwen3-TTS] Loaded saved int8 weights from: {int8_source}")
+        except Exception as e:
+            print(f"⚠️ [Qwen3-TTS] Failed to load saved int8 weights: {e}")
+    return model
+
 # Register "qwen-tts" model folder for extra_model_paths.yaml support
 try:
     folder_paths.add_model_folder_path("qwen-tts", os.path.join(folder_paths.models_dir, "qwen-tts"))
@@ -900,10 +913,9 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
         qwen_root = os.path.join(comfy_models_path, "qwen-tts")
         model_name = os.path.basename(final_source)
         int8_folder = os.path.join(qwen_root, model_name + "_int8")
-        if os.path.isdir(int8_folder):
+        if os.path.isdir(int8_folder) and os.path.exists(os.path.join(int8_folder, "pytorch_model.bin")):
             int8_source = int8_folder
-            final_source = int8_source
-            print(f"🔧 [Qwen3-TTS] Loading pre-quantized int8 model from: {int8_folder}")
+            print(f"🔧 [Qwen3-TTS] Found pre-quantized int8 model at: {int8_folder}")
 
     if Qwen3TTSModel is None:
         raise RuntimeError(
@@ -936,7 +948,7 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
             from sageattention import sageattn
             print(f"🔧 [Qwen3-TTS] Loading model with sage_attn (sageattention)")
             
-            model = _load_model_with_int8(final_source, device_map=device, dtype=dtype, quantization_config=quant_config)
+            model = _load_int8_model(final_source, int8_source, device_map=device, dtype=dtype, quantization_config=quant_config)
             
             # Patch attention modules to use sageattention
             patched_count = 0
@@ -969,7 +981,7 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
             
         except (ImportError, Exception) as e:
             print(f"⚠️ [Qwen3-TTS] Failed with sage_attn, falling back to default attention: {e}")
-            model = _load_model_with_int8(final_source, device_map=device, dtype=dtype, quantization_config=quant_config)
+            model = _load_int8_model(final_source, int8_source, device_map=device, dtype=dtype, quantization_config=quant_config)
     else:
         # comfy_kitchen branch (int8_attention kernel via Comfy Kitchen package)
         if use_comfy_kitchen:
@@ -978,21 +990,21 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
                 if not comfy_kitchen.int8_attention_is_available():
                     raise ImportError("comfy_kitchen int8_attention not available on this device")
                 print(f"🔧 [Qwen3-TTS] Loading model with comfy_kitchen attention (base sdpa; kitchen backend active)")
-                model = _load_model_with_int8(final_source, device_map=device, dtype=dtype, attn_implementation="sdpa", quantization_config=quant_config)
+                model = _load_int8_model(final_source, int8_source, device_map=device, dtype=dtype, attn_implementation="sdpa", quantization_config=quant_config)
             except (ImportError, Exception) as e:
                 print(f"⚠️ [Qwen3-TTS] comfy_kitchen attention unavailable ({e}), falling back to sdpa")
-                model = _load_model_with_int8(final_source, device_map=device, dtype=dtype, attn_implementation="sdpa", quantization_config=quant_config)
+                model = _load_int8_model(final_source, int8_source, device_map=device, dtype=dtype, attn_implementation="sdpa", quantization_config=quant_config)
         else:
             try:
                 if attn_param:
                     print(f"🔧 [Qwen3-TTS] Loading model with attention: {attn_impl}")
-                    model = _load_model_with_int8(final_source, device_map=device, dtype=dtype, attn_implementation=attn_param, quantization_config=quant_config)
+                    model = _load_int8_model(final_source, int8_source, device_map=device, dtype=dtype, attn_implementation=attn_param, quantization_config=quant_config)
                 else:
                     print(f"🔧 [Qwen3-TTS] Loading model with attention: {attn_impl}")
-                    model = _load_model_with_int8(final_source, device_map=device, dtype=dtype, quantization_config=quant_config)
+                    model = _load_int8_model(final_source, int8_source, device_map=device, dtype=dtype, quantization_config=quant_config)
             except (ImportError, ValueError, Exception) as e:
                 print(f"⚠️ [Qwen3-TTS] Failed with {attn_impl}, falling back to default attention: {e}")
-                model = _load_model_with_int8(final_source, device_map=device, dtype=dtype, quantization_config=quant_config)
+                model = _load_int8_model(final_source, int8_source, device_map=device, dtype=dtype, quantization_config=quant_config)
     
     # Apply patches
     apply_qwen3_patches(model)
@@ -1002,16 +1014,22 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
     # --- save int8 model to disk for faster future loads ---
     if quantization == "int8":
         try:
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            comfy_models_path = os.path.join(os.path.dirname(os.path.dirname(current_dir)), "models")
+            qwen_root = os.path.join(comfy_models_path, "qwen-tts")
             model_name = os.path.basename(final_source)
             int8_folder = os.path.join(qwen_root, model_name + "_int8")
             if not os.path.exists(int8_folder):
                 print(f"💾 [Qwen3-TTS] Saving int8 model to: {int8_folder}")
                 os.makedirs(int8_folder, exist_ok=True)
-                model.model.save_pretrained(int8_folder)
-                model.processor.save_pretrained(int8_folder)
-                print(f"✅ [Qwen3-TTS] int8 model saved.")
+                torch.save(model.model.state_dict(), os.path.join(int8_folder, "pytorch_model.bin"))
+                if hasattr(model, 'processor') and model.processor is not None:
+                    model.processor.save_pretrained(int8_folder)
+                if hasattr(model.model, 'config'):
+                    model.model.config.save_pretrained(int8_folder)
+                print(f"✅ [Qwen3-TTS] int8 model state saved.")
         except Exception as e:
-            print(f"⚠️ [Qwen3-TTS] Failed to save int8 model: {e}")
+            print(f"⚠️ [Qwen3-TTS] Failed to save int8 model state: {e}")
     
     if unload_after:
         def unload_callback():
