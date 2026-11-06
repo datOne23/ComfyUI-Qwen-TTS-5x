@@ -6,9 +6,11 @@ to bf16 via comfy-kitchen, and loads into Qwen3TTSForConditionalGeneration.
 Optionally auto-converts on first load when no checkpoint exists on disk.
 
 Dequantization runs on the GPU (safe_open device="cuda"), the Hadamard matrix
-is cached per (groupsize, device, dtype), tensors are streamed straight into
-the meta skeleton so peak CPU RAM stays at one layer, TTSProgress is driven
-during the load, and missing keys raise loudly.
+is cached per (groupsize, device, dtype), comfy_quant metadata is pre-scanned
+on CPU, TTSProgress is driven during the load, missing keys raise loudly, and
+the Hadamard cache is cleared between loads. Peak GPU during load is the full
+bf16 model (~3.4 GB for 1.7B) since dequantized tensors accumulate in a dict
+until load_state_dict(assign=True) swaps in pointers.
 """
 
 import json
@@ -74,11 +76,12 @@ def _dequantize_convrot(qd, scale, gs, device):
     Approach A: comfy_kitchen TensorWiseINT8Layout.dequantize (preferred).
     Approach B: manual _build_hadamard + _rotate_weight inverse (fallback).
     """
+    global _FALLBACK_LOGGED
     # NOTE: must use kwargs form — to(dtype, device=...) is not a valid overload.
     qd = qd.to(device=device, dtype=torch.int8, non_blocking=True)
     scale = scale.to(device=device, non_blocking=True)
 
-    if _COMFY_KITCHEN_AVAILABLE and TensorWiseINT8Layout is not None:
+    if _COMFY_KITCHEN_AVAILABLE and TensorWiseINT8Layout is not None and not _FALLBACK_LOGGED:
         try:
             from comfy_kitchen.tensor import QuantizedTensor  # noqa: F401
             params = TensorWiseINT8Layout.Params(
@@ -91,13 +94,11 @@ def _dequantize_convrot(qd, scale, gs, device):
             deq = TensorWiseINT8Layout.dequantize(qd, params)
             return deq.to(device=device, dtype=torch.bfloat16, non_blocking=True)
         except Exception as e:
-            global _FALLBACK_LOGGED
-            if not _FALLBACK_LOGGED:
-                _FALLBACK_LOGGED = True
-                print(
-                    "⚠️ [Qwen3-TTS] int8-convrot: comfy-kitchen dequantize failed: "
-                    f"{e}; using manual Hadamard fallback"
-                )
+            _FALLBACK_LOGGED = True
+            print(
+                "⚠️ [Qwen3-TTS] int8-convrot: comfy-kitchen dequantize failed: "
+                f"{e}; using manual Hadamard fallback"
+            )
 
     # Approach B: manual Hadamard inverse rotation (H is self-inverse).
     # Rotate in bf16 before applying the per-tensor scalar scale; scale
@@ -141,6 +142,10 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
     attn_implementation = kwargs.get("attn_implementation")
     load_speech_tokenizer = kwargs.get("load_speech_tokenizer", False)
     auto_convert = kwargs.get("auto_convert", False)
+
+    # Clear any Hadamard matrices left over from a previous load with a
+    # different groupsize, so they don't sit in VRAM forever.
+    _HADAMARD_CACHE.clear()
 
     # --- 1. Check for pre-converted checkpoint --------------------------------
     if not os.path.exists(int8_convrot_path):
@@ -251,9 +256,11 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
     # --- 6. Read checkpoint and dequantize int8+convrot layers ------------------
     print(f"🔧 [Qwen3-TTS] int8-convrot: reading {int8_convrot_path}")
     target_device = torch.device(device)
-    st_device = "cuda" if (str(device).startswith("cuda") and torch.cuda.is_available()) else "cpu"
-    if st_device != str(device):
-        print(f"⚠️ [Qwen3-TTS] int8-convrot: cuda unavailable; reading checkpoint on cpu")
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        st_device = str(device)
+    else:
+        st_device = "cpu"
+        print("⚠️ [Qwen3-TTS] int8-convrot: cuda unavailable; reading checkpoint on cpu")
 
     state_dict = {}
     with safe_open(int8_convrot_path, framework="pt", device=st_device) as st:
@@ -269,6 +276,15 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
                       if not k.endswith(".weight_scale") and not k.endswith(".comfy_quant")]
         total = len(plain_keys)
 
+        # Pre-scan all comfy_quant metadata on CPU before the GPU loop so the
+        # per-tensor host decode (.tolist() -> bytes -> json) never stalls the
+        # GPU pipeline.
+        groupsize_map = {}
+        for base in quantized_bases:
+            cq_raw = st.get_tensor(f"{base}.comfy_quant").cpu()
+            cfg = _decode_comfy_quant(cq_raw)
+            groupsize_map[base] = int(cfg.get("convrot_groupsize", 256))
+
         pbar = None
         try:
             pbar = TTSProgress(max_new_tokens=max(1, total), phase_total=100)
@@ -282,9 +298,7 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
             if base is not None and base in quantized_bases:
                 qd = st.get_tensor(key)
                 scale = st.get_tensor(f"{base}.weight_scale")
-                cq_raw = st.get_tensor(f"{base}.comfy_quant")
-                cfg = _decode_comfy_quant(cq_raw)
-                gs = int(cfg.get("convrot_groupsize", 256))
+                gs = groupsize_map[base]
                 state_dict[key] = _dequantize_convrot(qd, scale, gs, st_device)
             else:
                 # Non-quantized tensor: move to GPU, no rotation needed.
@@ -311,9 +325,11 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
     missing = list(getattr(result, "missing_keys", None) or [])
     unexpected = list(getattr(result, "unexpected_keys", None) or [])
     if missing:
+        shown = missing[:20]
         raise RuntimeError(
-            "[Qwen3-TTS] int8-convrot: missing keys after load_state_dict:\n  "
-            + "\n  ".join(missing)
+            "[Qwen3-TTS] int8-convrot: missing keys after load_state_dict "
+            f"({len(missing)} total, showing first 20):\n  "
+            + "\n  ".join(shown)
         )
     print(f"🔧 [Qwen3-TTS] int8-convrot: missing={len(missing)}, unexpected={len(unexpected)}")
 
@@ -341,22 +357,25 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
         print(f"⚠️ [Qwen3-TTS] int8-convrot: processor load failed: {e}")
 
     # --- 10. Speech tokenizer (needed for audio decoding in generate) ---
-    st_dir = os.path.join(source, "speech_tokenizer")
-    if not os.path.isdir(st_dir):
-        raise RuntimeError(
-            f"[Qwen3-TTS] int8-convrot: speech_tokenizer directory not found at {st_dir}. "
-            f"generate_voice_design() requires it to decode audio codes to waveform. "
-            f"Ensure the model folder contains speech_tokenizer/."
-        )
-    try:
-        from qwen_tts import Qwen3TTSTokenizer
-        speech_tokenizer = Qwen3TTSTokenizer.from_pretrained(st_dir, local_files_only=True)
-        model.load_speech_tokenizer(speech_tokenizer)
-        print(f"✅ [Qwen3-TTS] int8-convrot: speech tokenizer loaded from {st_dir}")
-    except Exception as e:
-        raise RuntimeError(
-            f"[Qwen3-TTS] int8-convrot: failed to load speech tokenizer from {st_dir}: {e}"
-        )
+    if load_speech_tokenizer:
+        st_dir = os.path.join(source, "speech_tokenizer")
+        if not os.path.isdir(st_dir):
+            raise RuntimeError(
+                f"[Qwen3-TTS] int8-convrot: speech_tokenizer directory not found at {st_dir}. "
+                f"generate_voice_design() requires it to decode audio codes to waveform. "
+                f"Ensure the model folder contains speech_tokenizer/."
+            )
+        try:
+            from qwen_tts import Qwen3TTSTokenizer
+            speech_tokenizer = Qwen3TTSTokenizer.from_pretrained(st_dir, local_files_only=True)
+            model.load_speech_tokenizer(speech_tokenizer)
+            print(f"✅ [Qwen3-TTS] int8-convrot: speech tokenizer loaded from {st_dir}")
+        except Exception as e:
+            raise RuntimeError(
+                f"[Qwen3-TTS] int8-convrot: failed to load speech tokenizer from {st_dir}: {e}"
+            )
+    else:
+        print(f"⚠️ [Qwen3-TTS] int8-convrot: speech tokenizer skipped (load_speech_tokenizer=False)")
 
     # --- 11. Wrap in Qwen3TTSModel ----------------------------------------------
     wrap = Qwen3TTSModel(model=model, processor=processor,
