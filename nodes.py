@@ -480,16 +480,21 @@ def _load_w8a8_model_fast(model_dir: str, w8a8_path: str, device="cuda",
         model = Qwen3TTSForConditionalGeneration(config)
 
     # 4. Load int8 weights directly from the saved checkpoint
+    #    assign=True is required because parameters are on meta device — without it
+    #    PyTorch tries to copy in-place into meta tensors (a no-op).
     print(f"🚀 [Qwen3-TTS] w8a8 fast: loading int8 weights from {w8a8_path}")
     state_dict = load_file(w8a8_path, device="cpu")
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    missing_list = missing.missing_keys if hasattr(missing, "missing_keys") else missing
-    unexpected_list = unexpected.unexpected_keys if hasattr(unexpected, "unexpected_keys") else unexpected
+    result = model.load_state_dict(state_dict, strict=False, assign=True)
+    missing_list = result.missing_keys if hasattr(result, "missing_keys") else result[0] if isinstance(result, (list, tuple)) else []
+    unexpected_list = result.unexpected_keys if hasattr(result, "unexpected_keys") else result[1] if isinstance(result, (list, tuple)) and len(result) > 1 else []
     print(f"🔧 [Qwen3-TTS] w8a8 fast: {len(state_dict)} tensors loaded, "
           f"missing={len(missing_list)}, unexpected={len(unexpected_list)}")
 
-    # 5. Move to device/dtype
-    model = model.to(dtype=dtype).to(device)
+    # 5. Move to device — do NOT change dtype: int8 weights must stay int8,
+    #    non-quantized params are already in checkpoint dtype (e.g. bf16).
+    #    to(device) is safe here because assign=True already replaced all meta
+    #    parameters with real checkpoint tensors.
+    model = model.to(device)
     model.eval()
 
     # 6. Generation config (small JSON, cheap)
