@@ -16,92 +16,111 @@ from .int8_convrot import load_int8_convrot_model
 from .paths import _model_search_roots, _resolve_custom_model_dir
 
 
-def unload_cached_model(cache_key=None):
-    """Unload cached model(s) and clear GPU memory.
+def _destroy_single_model(model):
+    if model is None:
+        return
 
-    Args:
-        cache_key: If provided, only unload that specific model.
-                   If None, unload all cached models.
-    """
+    model.__dict__.pop("_normalize_audio_inputs", None)
+    model.__dict__.pop("_unload_callback", None)
+
+    inner = model.__dict__.pop("model", None)
+
+    for attr in ("processor", "tokenizer", "vocoder", "audio_encoder"):
+        model.__dict__.pop(attr, None)
+    if "generate_defaults" in model.__dict__:
+        model.__dict__["generate_defaults"] = {}
+
+    if inner is not None:
+        for attr in ("speech_tokenizer", "generation_config", "generate_config",
+                     "config", "hf_device_map", "hf_quantizer",
+                     "processor", "tokenizer"):
+            inner.__dict__.pop(attr, None)
+
+        for hook_dict in ("_forward_hooks", "_forward_pre_hooks",
+                          "_backward_hooks", "_backward_pre_hooks",
+                          "_state_dict_hooks", "_load_state_dict_pre_hooks"):
+            d = getattr(inner, hook_dict, None)
+            if isinstance(d, dict):
+                d.clear()
+
+        try:
+            for p in inner.parameters(recurse=True):
+                if p.grad is not None:
+                    p.grad = None
+        except Exception:
+            pass
+
+        try:
+            inner.cpu()
+        except Exception:
+            pass
+
+        del inner
+
+    del model
+
+
+def unload_cached_model(cache_key=None):
+    """Unload cached model(s) and clear GPU memory."""
     models_to_unload = []
-    if cache_key and cache_key in constants._MODEL_CACHE:
-        print(f"[Qwen3-TTS] Unloading model: {cache_key}...")
-        models_to_unload.append(constants._MODEL_CACHE.pop(cache_key))
-    elif constants._MODEL_CACHE:
-        print(f"[Qwen3-TTS] Unloading {len(constants._MODEL_CACHE)} cached model(s)...")
-        models_to_unload = list(constants._MODEL_CACHE.values())
+
+    if cache_key is not None:
+        m = constants._MODEL_CACHE.get(cache_key)
+        if m is not None:
+            print(f"[Qwen3-TTS] Unloading model: {cache_key}...")
+            models_to_unload.append(m)
+    else:
+        if constants._MODEL_CACHE:
+            print(f"[Qwen3-TTS] Unloading {len(constants._MODEL_CACHE)} cached model(s)...")
+            models_to_unload.extend(constants._MODEL_CACHE.values())
+
+    if not models_to_unload:
+        return
+
+    for i in range(len(models_to_unload)):
+        _destroy_single_model(models_to_unload[i])
+        models_to_unload[i] = None
+
+    if cache_key is not None:
+        constants._MODEL_CACHE.pop(cache_key, None)
+    else:
         constants._MODEL_CACHE.clear()
 
-    inner = None
-    # Break every reference holding CUDA/CPU tensors so the model object becomes
-    # collectable (weights freed from both VRAM and RAM) before empty_cache() runs.
-    for model in models_to_unload:
-        # Break the wrapper self-cycle introduced by apply_qwen3_patches: a bound
-        # MethodType references the wrapper itself, keeping it alive past GC.
-        try:
-            if hasattr(model, "_normalize_audio_inputs"):
-                del model._normalize_audio_inputs
-        except Exception:
-            pass
-        try:
-            if hasattr(model, "model") and model.model is not None:
-                inner = model.model
-                # Clear non-tensor references first
-                if hasattr(inner, "speech_tokenizer") and inner.speech_tokenizer is not None:
-                    inner.speech_tokenizer = None
-                if hasattr(inner, "generate_config"):
-                    inner.generate_config = None
-                # Drop the wrapper's reference to the inner model BEFORE moving to
-                # CPU, so a cpu() failure cannot leave a dangling CUDA reference.
-                model.model = None
-                # Relocate weights off CUDA so empty_cache() can reclaim VRAM.
-                if hasattr(inner, "cpu"):
-                    inner.cpu()
-                # Drop our local reference so GC can collect the whole model.
-                inner = None
-        except Exception:
-            pass
-        try:
-            if hasattr(model, "processor"):
-                model.processor = None
-        except Exception:
-            pass
-        try:
-            model._unload_callback = None
-        except Exception:
-            pass
-        try:
-            if hasattr(model, "generate_defaults"):
-                model.generate_defaults = {}
-        except Exception:
-            pass
-
-    # Ensure no lingering local reference to the last inner model survives
-    # past the GC/empty_cache calls below.
-    inner = None
+    models_to_unload.clear()
     del models_to_unload
 
     import gc
     gc.collect()
     gc.collect()
 
-    model_management.soft_empty_cache()
     if torch.cuda.is_available():
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
         try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+
+    try:
+        model_management.soft_empty_cache()
+    except Exception as e:
+        print(f"[Qwen3-TTS] soft_empty_cache failed: {e}")
+
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
         except Exception:
             pass
 
-    gc.collect()
-    gc.collect()
-    gc.collect()
+    for _ in range(3):
+        gc.collect()
 
     if torch.cuda.is_available():
-        torch.cuda.synchronize()
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
 
-    print(f"[Qwen3-TTS] Model cache and GPU memory cleared")
+    print("[Qwen3-TTS] Model cache and GPU memory cleared")
 
 
 def apply_qwen3_patches(model):
@@ -109,9 +128,8 @@ def apply_qwen3_patches(model):
     if model is None:
         return
 
-    # 1. Monkeypatch model._normalize_audio_inputs to return mutable lists to avoid upstream tuple assignment bug
-    # and to support (waveform, sr) tuple format from ComfyUI
-    orig_normalize = getattr(model, "_normalize_audio_inputs", None)
+    if "_normalize_audio_inputs" in model.__dict__:
+        return
 
     def _safe_normalize(self, audios):
         # Adapted from upstream but returns list entries as lists [waveform, sr]
