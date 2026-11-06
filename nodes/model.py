@@ -362,7 +362,7 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
                 model = load_int8_convrot_model(
                     final_source, int8_convrot_path, device=device, dtype=dtype,
                     attn_implementation=attn_param,
-                    load_speech_tokenizer=(model_type == "Base"),
+                    load_speech_tokenizer=True,
                 )
                 convrot_loaded = True
             else:
@@ -370,7 +370,7 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
                 model = load_int8_convrot_model(
                     final_source, int8_convrot_path, device=device, dtype=dtype,
                     attn_implementation=attn_param,
-                    load_speech_tokenizer=(model_type == "Base"),
+                    load_speech_tokenizer=True,
                     auto_convert=True,
                 )
                 convrot_loaded = True
