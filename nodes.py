@@ -803,7 +803,11 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
         else:
             device = "cpu"
     
-    if device == "mps" and precision == "bf16":
+    if quantization == "int8":
+        # bitsandbytes int8 matmul kernels compute in float16; matching dtype
+        # avoids the bf16->fp16 cast warning at its source
+        dtype = torch.float16
+    elif device == "mps" and precision == "bf16":
         dtype = torch.bfloat16
     elif device == "mps":
         dtype = torch.float16
