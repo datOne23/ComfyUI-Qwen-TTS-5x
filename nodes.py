@@ -1097,9 +1097,12 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
                 if hasattr(model, "processor") and model.processor is not None:
                     model.processor.save_pretrained(int8_folder)
                 # Save config.json unconditionally so *_int8/ is a self-contained checkpoint
-                model.model.config.save_pretrained(int8_folder)
+                import json
+                with open(os.path.join(int8_folder, "config.json"), "w", encoding="utf-8") as f:
+                    json.dump(model.model.config.to_dict(), f, indent=2, ensure_ascii=False)
                 if hasattr(model.model, "generation_config") and model.model.generation_config is not None:
-                    model.model.generation_config.save_pretrained(int8_folder)
+                    with open(os.path.join(int8_folder, "generation_config.json"), "w", encoding="utf-8") as f:
+                        json.dump(model.model.generation_config.to_dict(), f, indent=2, ensure_ascii=False)
                 print(f"✅ [Qwen3-TTS] int8 model state saved.")
         except Exception as e:
             import traceback
