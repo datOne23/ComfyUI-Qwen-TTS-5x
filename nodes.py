@@ -1,6 +1,7 @@
 # ComfyUI-Qwen-TTS Node Implementation
 # Based on the open-source Qwen3-TTS project by Alibaba Qwen team
 
+import copy as _copy_module
 import os
 import sys
 import torch
@@ -8,6 +9,7 @@ import numpy as np
 import re
 import time
 from typing import Dict, Any, List, Optional, Tuple, Union
+from contextlib import contextmanager
 import folder_paths
 import types
 
@@ -26,6 +28,36 @@ try:
 except Exception:
     BitsAndBytesConfig = None  # type: ignore[assignment]
     _BITSANDBYTES_AVAILABLE = False
+
+_DICT_KEYS_TYPE = type({}.keys())
+
+
+@contextmanager
+def _allow_deepcopy_dict_keys():
+    """Allow copy.deepcopy to handle dict_keys view objects by converting to list.
+
+    Needed because bitsandbytes LLM.int8() calls deepcopy(model) during preprocessing
+    (transformers/integrations/bitsandbytes.py:get_keys_to_not_convert), which fails
+    on dict_keys attributes in some model architectures including Qwen3-TTS.
+    """
+    _orig_deepcopy = _copy_module.deepcopy
+
+    def _patched_deepcopy(obj, _memo=None):
+        if isinstance(obj, _DICT_KEYS_TYPE):
+            return list(obj)
+        return _orig_deepcopy(obj, _memo)
+
+    _copy_module.deepcopy = _patched_deepcopy
+    try:
+        yield
+    finally:
+        _copy_module.deepcopy = _orig_deepcopy
+
+
+def _load_model_with_int8(source, **kwargs):
+    """Load model with bitsandbytes int8, patching deepcopy for dict_keys safety."""
+    with _allow_deepcopy_dict_keys():
+        return Qwen3TTSModel.from_pretrained(source, **kwargs)
 
 # Register "qwen-tts" model folder for extra_model_paths.yaml support
 try:
@@ -877,7 +909,7 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
             from sageattention import sageattn
             print(f"🔧 [Qwen3-TTS] Loading model with sage_attn (sageattention)")
             
-            model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype, quantization_config=quant_config)
+            model = _load_model_with_int8(final_source, device_map=device, dtype=dtype, quantization_config=quant_config)
             
             # Patch attention modules to use sageattention
             patched_count = 0
@@ -910,7 +942,7 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
             
         except (ImportError, Exception) as e:
             print(f"⚠️ [Qwen3-TTS] Failed with sage_attn, falling back to default attention: {e}")
-            model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype, quantization_config=quant_config)
+            model = _load_model_with_int8(final_source, device_map=device, dtype=dtype, quantization_config=quant_config)
     else:
         # comfy_kitchen branch (int8_attention kernel via Comfy Kitchen package)
         if use_comfy_kitchen:
@@ -919,21 +951,21 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
                 if not comfy_kitchen.int8_attention_is_available():
                     raise ImportError("comfy_kitchen int8_attention not available on this device")
                 print(f"🔧 [Qwen3-TTS] Loading model with comfy_kitchen attention (base sdpa; kitchen backend active)")
-                model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype, attn_implementation="sdpa", quantization_config=quant_config)
+                model = _load_model_with_int8(final_source, device_map=device, dtype=dtype, attn_implementation="sdpa", quantization_config=quant_config)
             except (ImportError, Exception) as e:
                 print(f"⚠️ [Qwen3-TTS] comfy_kitchen attention unavailable ({e}), falling back to sdpa")
-                model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype, attn_implementation="sdpa", quantization_config=quant_config)
+                model = _load_model_with_int8(final_source, device_map=device, dtype=dtype, attn_implementation="sdpa", quantization_config=quant_config)
         else:
             try:
                 if attn_param:
                     print(f"🔧 [Qwen3-TTS] Loading model with attention: {attn_impl}")
-                    model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype, attn_implementation=attn_param, quantization_config=quant_config)
+                    model = _load_model_with_int8(final_source, device_map=device, dtype=dtype, attn_implementation=attn_param, quantization_config=quant_config)
                 else:
                     print(f"🔧 [Qwen3-TTS] Loading model with attention: {attn_impl}")
-                    model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype, quantization_config=quant_config)
+                    model = _load_model_with_int8(final_source, device_map=device, dtype=dtype, quantization_config=quant_config)
             except (ImportError, ValueError, Exception) as e:
                 print(f"⚠️ [Qwen3-TTS] Failed with {attn_impl}, falling back to default attention: {e}")
-                model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype, quantization_config=quant_config)
+                model = _load_model_with_int8(final_source, device_map=device, dtype=dtype, quantization_config=quant_config)
     
     # Apply patches
     apply_qwen3_patches(model)
