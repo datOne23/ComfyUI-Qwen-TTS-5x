@@ -23,6 +23,20 @@ from .nodes import (
 )
 from .train import Qwen3TTS_Train_Node
 
+# Fast-mode (CUDA-graph) nodes - separate module, existing FB_Qwen3TTS* entries
+# below are left untouched.
+from .fast_nodes import (  # noqa: E402
+    Qwen3TTSFastLoader,
+    Qwen3TTSFastCustomVoice,
+    Qwen3TTSFastVoiceDesign,
+    Qwen3TTSFastVoiceClone,
+    Qwen3TTSFastVoiceCloneFromFile,
+    Qwen3TTSFastCreateClonePrompt,
+    Qwen3TTSFastCloneWithPrompt,
+    Qwen3TTSFastBatchGenerate,
+    Qwen3TTSFastUnload,
+)
+
 # Node mappings
 NODE_CLASS_MAPPINGS = {
     "FB_Qwen3TTSVoiceClone": VoiceCloneNode,
@@ -34,6 +48,15 @@ NODE_CLASS_MAPPINGS = {
     "FB_Qwen3TTSSaveVoice": SaveVoiceNode,
     "FB_Qwen3TTSLoadSpeaker": LoadSpeakerNode,
     "FB_Qwen3TTSTrain": Qwen3TTS_Train_Node,
+    "Qwen3TTSFastLoader": Qwen3TTSFastLoader,
+    "Qwen3TTSFastCustomVoice": Qwen3TTSFastCustomVoice,
+    "Qwen3TTSFastVoiceDesign": Qwen3TTSFastVoiceDesign,
+    "Qwen3TTSFastVoiceClone": Qwen3TTSFastVoiceClone,
+    "Qwen3TTSFastVoiceCloneFromFile": Qwen3TTSFastVoiceCloneFromFile,
+    "Qwen3TTSFastCreateClonePrompt": Qwen3TTSFastCreateClonePrompt,
+    "Qwen3TTSFastCloneWithPrompt": Qwen3TTSFastCloneWithPrompt,
+    "Qwen3TTSFastBatchGenerate": Qwen3TTSFastBatchGenerate,
+    "Qwen3TTSFastUnload": Qwen3TTSFastUnload,
 }
 
 # Node display name mappings
@@ -47,6 +70,15 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FB_Qwen3TTSSaveVoice": "💾 Qwen3-TTS SaveVoice",
     "FB_Qwen3TTSLoadSpeaker": "🎙️ Qwen3-TTS LoadSpeaker",
     "FB_Qwen3TTSTrain": "🏋️ Qwen3-TTS Train",
+    "Qwen3TTSFastLoader": "Qwen3 TTS Fast Loader",
+    "Qwen3TTSFastCustomVoice": "Qwen3 TTS Custom Voice (Fast)",
+    "Qwen3TTSFastVoiceDesign": "Qwen3 TTS Voice Design (Fast)",
+    "Qwen3TTSFastVoiceClone": "Qwen3 TTS Voice Clone (Fast)",
+    "Qwen3TTSFastVoiceCloneFromFile": "Qwen3 TTS Voice Clone File (Fast)",
+    "Qwen3TTSFastCreateClonePrompt": "Qwen3 TTS Create Clone Prompt (Fast)",
+    "Qwen3TTSFastCloneWithPrompt": "Qwen3 TTS Clone with Prompt (Fast)",
+    "Qwen3TTSFastBatchGenerate": "Qwen3 TTS Batch Generate (Fast)",
+    "Qwen3TTSFastUnload": "Qwen3 TTS Fast Unload",
 }
 
 # Version information
