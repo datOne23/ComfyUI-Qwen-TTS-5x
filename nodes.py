@@ -32,32 +32,27 @@ except Exception:
 _DICT_KEYS_TYPE = type({}.keys())
 
 
-@contextmanager
-def _allow_deepcopy_dict_keys():
-    """Allow copy.deepcopy to handle dict_keys view objects by converting to list.
+def _deepcopy_dict_keys(obj, memo=None):
+    """copy.deepcopy handler for dict_keys view objects.
 
-    Needed because bitsandbytes LLM.int8() calls deepcopy(model) during preprocessing
-    (transformers/integrations/bitsandbytes.py:get_keys_to_not_convert), which fails
-    on dict_keys attributes in some model architectures including Qwen3-TTS.
+    Registers into copy._deepcopy_dispatch so that deepcopy(model) — called by
+    bitsandbytes LLM.int8() preprocessing (transformers/integrations/bitsandbytes.py
+    :get_keys_to_not_convert) — never crashes on dict_keys attributes anywhere in
+    the Qwen3-TTS model graph.
     """
-    _orig_deepcopy = _copy_module.deepcopy
+    return list(obj)
 
-    def _patched_deepcopy(obj, _memo=None):
-        if isinstance(obj, _DICT_KEYS_TYPE):
-            return list(obj)
-        return _orig_deepcopy(obj, _memo)
 
-    _copy_module.deepcopy = _patched_deepcopy
-    try:
-        yield
-    finally:
-        _copy_module.deepcopy = _orig_deepcopy
+try:
+    _copy_module._deepcopy_dispatch[_DICT_KEYS_TYPE] = _deepcopy_dict_keys
+    _DICT_KEYS_DISPATCH_PATCHED = True
+except Exception:
+    _DICT_KEYS_DISPATCH_PATCHED = False
 
 
 def _load_model_with_int8(source, **kwargs):
-    """Load model with bitsandbytes int8, patching deepcopy for dict_keys safety."""
-    with _allow_deepcopy_dict_keys():
-        return Qwen3TTSModel.from_pretrained(source, **kwargs)
+    """Load model with bitsandbytes int8 (dict_keys deepcopy handled via dispatch table)."""
+    return Qwen3TTSModel.from_pretrained(source, **kwargs)
 
 # Register "qwen-tts" model folder for extra_model_paths.yaml support
 try:
