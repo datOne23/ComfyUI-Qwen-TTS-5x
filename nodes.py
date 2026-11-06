@@ -733,18 +733,30 @@ def unload_cached_model(cache_key=None):
 
     Args:
         cache_key: If provided, only unload that specific model.
-                  If None, unload all cached models.
+                   If None, unload all cached models.
     """
     global _MODEL_CACHE
 
+    models_to_unload = []
     if cache_key and cache_key in _MODEL_CACHE:
         print(f"[Qwen3-TTS] Unloading model: {cache_key}...")
-        del _MODEL_CACHE[cache_key]
+        models_to_unload.append(_MODEL_CACHE.pop(cache_key))
     elif _MODEL_CACHE:
         print(f"[Qwen3-TTS] Unloading {len(_MODEL_CACHE)} cached model(s)...")
+        models_to_unload = list(_MODEL_CACHE.values())
         _MODEL_CACHE.clear()
 
+    # Move models to CPU before releasing references, so CUDA tensors are freed
+    for model in models_to_unload:
+        try:
+            if hasattr(model, "model") and hasattr(model.model, "cpu"):
+                model.model = model.model.cpu()
+        except Exception:
+            pass
+
     model_management.soft_empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     import gc
     gc.collect()
