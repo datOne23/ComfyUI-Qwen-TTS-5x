@@ -168,7 +168,12 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
             "fp16": torch.float16,  "float16":  torch.float16,
             "fp32": torch.float32,  "float32":  torch.float32,
         }
-        out_dtype = _DTYPE_MAP.get(str(dtype).lower(), torch.bfloat16)
+        _key = str(dtype).lower()
+        if _key.startswith("torch."):
+            _key = _key[6:]
+        if _key not in _DTYPE_MAP:
+            print(f"⚠️ [Qwen3-TTS] int8-convrot: unrecognized dtype '{dtype}', using bf16")
+        out_dtype = _DTYPE_MAP.get(_key, torch.bfloat16)
 
     # Clear any Hadamard matrices left over from a previous load with a
     # different groupsize, so they don't sit in VRAM forever.
@@ -352,10 +357,13 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
                             f"⚠️ [Qwen3-TTS] int8-convrot: QuantizedTensor wrap failed for "
                             f"{key}: {e}; falling back to dequantize"
                         )
-                        state_dict[key] = _dequantize_convrot(qd, scale, gs, st_device)
+                        state_dict[key] = _dequantize_convrot(qd, scale, gs, st_device, out_dtype=out_dtype)
             else:
-                # Non-quantized tensor: move to GPU, no rotation needed.
-                state_dict[key] = st.get_tensor(key).to(target_device, non_blocking=True)
+                # Non-quantized tensor: move to GPU, cast to out_dtype if floating-point.
+                t = st.get_tensor(key).to(target_device, non_blocking=True)
+                if t.is_floating_point() and t.dtype != out_dtype:
+                    t = t.to(out_dtype)
+                state_dict[key] = t
 
             done += 1
             if pbar is not None and (done % 16 == 0 or done == total):
