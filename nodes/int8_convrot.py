@@ -4,6 +4,11 @@ Loads a pre-converted *_int8_convrot.safetensors checkpoint (produced by
 comfy-model-tools/quant_int8_convrot.py), dequantizes each int8+convrot layer
 to bf16 via comfy-kitchen, and loads into Qwen3TTSForConditionalGeneration.
 Optionally auto-converts on first load when no checkpoint exists on disk.
+
+Dequantization runs on the GPU (safe_open device="cuda"), the Hadamard matrix
+is cached per (groupsize, device, dtype), tensors are streamed straight into
+the meta skeleton so peak CPU RAM stays at one layer, TTSProgress is driven
+during the load, and missing keys raise loudly.
 """
 
 import json
@@ -31,6 +36,12 @@ CONVERTER_SCRIPT = os.path.join(COMFY_ROOT, "custom_nodes", "comfy-model-tools",
 INT8_CONVROT_EXCLUDE = ("codec_encoder|codec_decoder|speaker_encoder|vocoder|"
                         "seanet|audio_codec|feature_projection|output_proj|lm_head")
 
+# Hadamard matrices cached by (groupsize, device, dtype) so we never rebuild
+# the same matrix twice during a load.
+_HADAMARD_CACHE = {}
+# Log the comfy-kitchen -> manual fallback path exactly once per process.
+_FALLBACK_LOGGED = False
+
 
 def _resolve_model_source(source):
     """Resolve a model directory to the actual weight file for the converter.
@@ -57,14 +68,14 @@ def _decode_comfy_quant(raw):
     return json.loads(text)
 
 
-def _dequantize_convrot(qd, scale, gs):
-    """Dequantize an int8+convrot weight to bf16.
+def _dequantize_convrot(qd, scale, gs, device):
+    """Dequantize an int8+convrot weight to bf16, entirely on `device`.
 
     Approach A: comfy_kitchen TensorWiseINT8Layout.dequantize (preferred).
     Approach B: manual _build_hadamard + _rotate_weight inverse (fallback).
     """
-    qd = qd.to(torch.int8)
-    scale = scale.to(torch.float32)
+    qd = qd.to(torch.int8, device=device, non_blocking=True)
+    scale = scale.to(device=device, non_blocking=True)
 
     if _COMFY_KITCHEN_AVAILABLE and TensorWiseINT8Layout is not None:
         try:
@@ -77,15 +88,29 @@ def _dequantize_convrot(qd, scale, gs):
                 convrot_groupsize=gs,
             )
             deq = TensorWiseINT8Layout.dequantize(qd, params)
-            return deq.to(torch.bfloat16)
-        except Exception:
-            pass
+            return deq.to(torch.bfloat16, device=device, non_blocking=True)
+        except Exception as e:
+            global _FALLBACK_LOGGED
+            if not _FALLBACK_LOGGED:
+                _FALLBACK_LOGGED = True
+                print(
+                    "⚠️ [Qwen3-TTS] int8-convrot: comfy-kitchen dequantize failed: "
+                    f"{e}; using manual Hadamard fallback"
+                )
 
     # Approach B: manual Hadamard inverse rotation (H is self-inverse).
-    h = _build_hadamard(gs, device="cpu", dtype=torch.float32)
-    deq = qd.to(torch.float32) * scale
+    # Rotate in bf16 before applying the per-tensor scalar scale; scale
+    # commutes with the rotation so this is mathematically equivalent to
+    # dequant-then-rotate-then-scale.
+    cache_key = (gs, str(device), torch.bfloat16)
+    h = _HADAMARD_CACHE.get(cache_key)
+    if h is None:
+        h = _build_hadamard(gs, device=device, dtype=torch.bfloat16)
+        _HADAMARD_CACHE[cache_key] = h
+    deq = qd.to(torch.bfloat16)
     deq = _rotate_weight(deq, h, gs)
-    return deq.to(torch.bfloat16)
+    deq = deq * scale.to(torch.bfloat16)
+    return deq
 
 
 def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
@@ -103,7 +128,8 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
 
     Raises:
         RuntimeError: if comfy-kitchen is unavailable, conversion fails, or
-            no checkpoint exists and auto_convert is False.
+            no checkpoint exists and auto_convert is False, or keys are missing
+            after load_state_dict.
     """
     if not _COMFY_KITCHEN_AVAILABLE:
         raise RuntimeError(
@@ -223,8 +249,13 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
 
     # --- 6. Read checkpoint and dequantize int8+convrot layers ------------------
     print(f"🔧 [Qwen3-TTS] int8-convrot: reading {int8_convrot_path}")
+    target_device = torch.device(device)
+    st_device = "cuda" if (str(device).startswith("cuda") and torch.cuda.is_available()) else "cpu"
+    if st_device != str(device):
+        print(f"⚠️ [Qwen3-TTS] int8-convrot: cuda unavailable; reading checkpoint on cpu")
+
     state_dict = {}
-    with safe_open(int8_convrot_path, framework="pt", device="cpu") as st:
+    with safe_open(int8_convrot_path, framework="pt", device=st_device) as st:
         keys = list(st.keys())
         weight_scale_keys = {k for k in keys if k.endswith(".weight_scale")}
         comfy_quant_keys = {k for k in keys if k.endswith(".comfy_quant")}
@@ -233,9 +264,19 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
             for k in weight_scale_keys
             if f"{k[:-len('.weight_scale')]}.comfy_quant" in comfy_quant_keys
         }
-        for key in keys:
-            if key.endswith(".weight_scale") or key.endswith(".comfy_quant"):
-                continue
+        plain_keys = [k for k in keys
+                      if not k.endswith(".weight_scale") and not k.endswith(".comfy_quant")]
+        total = len(plain_keys)
+
+        pbar = None
+        try:
+            pbar = TTSProgress(max_new_tokens=max(1, total), phase_total=100)
+            pbar.phase_loaded()
+        except Exception:
+            pbar = None
+
+        done = 0
+        for key in plain_keys:
             base = key[:-len(".weight")] if key.endswith(".weight") else None
             if base is not None and base in quantized_bases:
                 qd = st.get_tensor(key)
@@ -243,24 +284,41 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
                 cq_raw = st.get_tensor(f"{base}.comfy_quant")
                 cfg = _decode_comfy_quant(cq_raw)
                 gs = int(cfg.get("convrot_groupsize", 256))
-                deq = _dequantize_convrot(qd, scale, gs)
-                state_dict[key] = deq
+                state_dict[key] = _dequantize_convrot(qd, scale, gs, st_device)
             else:
-                state_dict[key] = st.get_tensor(key)
+                # Non-quantized tensor: move to GPU, no rotation needed.
+                state_dict[key] = st.get_tensor(key).to(target_device, non_blocking=True)
+
+            done += 1
+            if pbar is not None and (done % 16 == 0 or done == total):
+                try:
+                    pct = int(done / total * 100)
+                    pbar.pbar.update_absolute(pct, 100, None)
+                except Exception:
+                    pass
+
+    if pbar is not None:
+        try:
+            pbar.phase_done()
+            pbar.unregister()
+        except Exception:
+            pass
 
     # --- 7. Load into model (meta-safe) -----------------------------------------
     print(f"🚀 [Qwen3-TTS] int8-convrot: loading {len(state_dict)} tensors")
     result = model.load_state_dict(state_dict, strict=False, assign=True)
-    missing = getattr(result, "missing_keys", None)
-    unexpected = getattr(result, "unexpected_keys", None)
-    print(f"🔧 [Qwen3-TTS] int8-convrot: missing={len(missing) if missing is not None else 'n/a'}, "
-          f"unexpected={len(unexpected) if unexpected is not None else 'n/a'}")
+    missing = list(getattr(result, "missing_keys", None) or [])
+    unexpected = list(getattr(result, "unexpected_keys", None) or [])
+    if missing:
+        raise RuntimeError(
+            "[Qwen3-TTS] int8-convrot: missing keys after load_state_dict:\n  "
+            + "\n  ".join(missing)
+        )
+    print(f"🔧 [Qwen3-TTS] int8-convrot: missing={len(missing)}, unexpected={len(unexpected)}")
 
-    # --- 8. Move to device with compute dtype ------------------------------------
-    model = model.to(device=device, dtype=dtype)
     model.eval()
 
-    # --- 9. Generation config ----------------------------------------------------
+    # --- 8. Generation config ----------------------------------------------------
     gen_cfg_path = os.path.join(source, "generation_config.json")
     if os.path.exists(gen_cfg_path):
         with open(gen_cfg_path, "r", encoding="utf-8") as f:
@@ -270,7 +328,7 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
         else:
             model.generate_config = gen_cfg
 
-    # --- 10. Text processor (needed for text tokenization in generate) ---
+    # --- 9. Text processor (needed for text tokenization in generate) ---
     processor = None
     try:
         from transformers import AutoTokenizer
@@ -281,7 +339,7 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
     except Exception as e:
         print(f"⚠️ [Qwen3-TTS] int8-convrot: processor load failed: {e}")
 
-    # --- 11. Speech tokenizer (needed for audio decoding in generate) ---
+    # --- 10. Speech tokenizer (needed for audio decoding in generate) ---
     st_dir = os.path.join(source, "speech_tokenizer")
     if not os.path.isdir(st_dir):
         raise RuntimeError(
@@ -299,7 +357,7 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
             f"[Qwen3-TTS] int8-convrot: failed to load speech tokenizer from {st_dir}: {e}"
         )
 
-    # --- 12. Wrap in Qwen3TTSModel ----------------------------------------------
+    # --- 11. Wrap in Qwen3TTSModel ----------------------------------------------
     wrap = Qwen3TTSModel(model=model, processor=processor,
                          generate_defaults=getattr(model, "generate_config", None) or {})
     print(f"🚀 [Qwen3-TTS] int8-convrot: model ready on {device}")
