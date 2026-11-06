@@ -21,6 +21,8 @@ import sys
 import torch
 from safetensors import safe_open
 
+from comfy_kitchen.tensor import QuantizedTensor
+
 from ._boot import (
     COMFY_ROOT,
     Qwen3TTSConfig,
@@ -293,13 +295,36 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
             pbar = None
 
         done = 0
+        use_w8a8 = os.environ.get("Qwen3TTS_INT8_W8A8", "1") == "1"
         for key in plain_keys:
             base = key[:-len(".weight")] if key.endswith(".weight") else None
             if base is not None and base in quantized_bases:
                 qd = st.get_tensor(key)
                 scale = st.get_tensor(f"{base}.weight_scale")
                 gs = groupsize_map[base]
-                state_dict[key] = _dequantize_convrot(qd, scale, gs, st_device)
+                if not use_w8a8:
+                    # Kill switch: dequantize to bf16 end to end.
+                    state_dict[key] = _dequantize_convrot(qd, scale, gs, st_device)
+                else:
+                    try:
+                        qt = QuantizedTensor(
+                            qdata=qd,
+                            layout_cls="TensorWiseINT8Layout",
+                            params=TensorWiseINT8Layout.Params(
+                                scale=scale.to(torch.float32),
+                                orig_dtype=torch.bfloat16,
+                                orig_shape=tuple(qd.shape),
+                                convrot=True,
+                                convrot_groupsize=gs,
+                            ),
+                        )
+                        state_dict[key] = qt
+                    except Exception as e:
+                        print(
+                            f"⚠️ [Qwen3-TTS] int8-convrot: QuantizedTensor wrap failed for "
+                            f"{key}: {e}; falling back to dequantize"
+                        )
+                        state_dict[key] = _dequantize_convrot(qd, scale, gs, st_device)
             else:
                 # Non-quantized tensor: move to GPU, no rotation needed.
                 state_dict[key] = st.get_tensor(key).to(target_device, non_blocking=True)
