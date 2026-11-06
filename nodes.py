@@ -3,6 +3,11 @@
 
 import copy as _copy_module
 import os
+# Force offline mode for HuggingFace Hub to prevent metadata lookups/downloads
+# during model loading.  local_files_only=True alone is not sufficient on
+# Windows (transformers #43502 — from_pretrained still hits /api/models/.../revision/main).
+os.environ.setdefault("HF_HUB_OFFLINE", "true")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "true")
 import sys
 import warnings
 import torch
@@ -106,7 +111,10 @@ def _convert_linear_to_int8(model, skip_modules):
 
 def _load_model_with_int8(source, **kwargs):
     """Load model with bitsandbytes int8 (dict_keys deepcopy handled via dispatch table)."""
-    return Qwen3TTSModel.from_pretrained(source, **kwargs)
+    load_kwargs = dict(kwargs)
+    load_kwargs.setdefault("local_files_only", True)
+    load_kwargs.setdefault("use_safetensors", True)
+    return Qwen3TTSModel.from_pretrained(source, **load_kwargs)
 
 
 def _load_int8_model(source, int8_source, **kwargs):
@@ -1091,7 +1099,14 @@ def download_model_if_needed(model_id: str, qwen_root: str) -> str:
     print(f"\n📥 [Qwen3-TTS] Downloading {model_id}...")
     try:
         from huggingface_hub import snapshot_download
-        snapshot_download(repo_id=model_id, local_dir=target_dir)
+        # Temporarily allow network for first-time download (HF_HUB_OFFLINE is
+        # set globally to prevent metadata lookups during from_pretrained).
+        prev_offline = os.environ.pop("HF_HUB_OFFLINE", None)
+        try:
+            snapshot_download(repo_id=model_id, local_dir=target_dir)
+        finally:
+            if prev_offline is not None:
+                os.environ["HF_HUB_OFFLINE"] = prev_offline
         print(f"✅ [Qwen3-TTS] {folder_name} downloaded successfully.\n")
         return target_dir
     except ImportError:
