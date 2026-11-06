@@ -150,14 +150,24 @@ def download_model_if_needed(model_id: str, qwen_root: str) -> str:
     print(f"\n📥 [Qwen3-TTS] Downloading {model_id}...")
     try:
         from huggingface_hub import snapshot_download
-        # Temporarily allow network for first-time download (HF_HUB_OFFLINE is
-        # set globally to prevent metadata lookups during from_pretrained).
-        prev_offline = os.environ.pop("HF_HUB_OFFLINE", None)
+        # Temporarily allow network for first-time download. HF_HUB_OFFLINE and
+        # TRANSFORMERS_OFFLINE are set globally to prevent metadata lookups during
+        # from_pretrained; override them only for this snapshot_download call.
+        prev_hf_offline = os.environ.get("HF_HUB_OFFLINE")
+        prev_tr_offline = os.environ.get("TRANSFORMERS_OFFLINE")
+        os.environ["HF_HUB_OFFLINE"] = "0"
+        os.environ["TRANSFORMERS_OFFLINE"] = "0"
         try:
             snapshot_download(repo_id=model_id, local_dir=target_dir)
         finally:
-            if prev_offline is not None:
-                os.environ["HF_HUB_OFFLINE"] = prev_offline
+            if prev_hf_offline is not None:
+                os.environ["HF_HUB_OFFLINE"] = prev_hf_offline
+            else:
+                os.environ.pop("HF_HUB_OFFLINE", None)
+            if prev_tr_offline is not None:
+                os.environ["TRANSFORMERS_OFFLINE"] = prev_tr_offline
+            else:
+                os.environ.pop("TRANSFORMERS_OFFLINE", None)
         print(f"✅ [Qwen3-TTS] {folder_name} downloaded successfully.\n")
         return target_dir
     except ImportError:
