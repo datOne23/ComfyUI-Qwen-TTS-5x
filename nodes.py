@@ -30,6 +30,21 @@ try:
 except Exception:  # model layer unavailable; progress degrades to coarse phases
     set_progress_hook = None
 
+# W8A8 fast-path imports — bypass from_pretrained() entirely on load.
+# Constructing from config + safetensors avoids loading the full ~3.4 GB bf16
+# model just to discard it.  See research: transformers #43502 / #48285,
+# Qwen3-TTS #389 (speech_tokenizer cache_dir bug).
+try:
+    from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
+    from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSForConditionalGeneration
+    from transformers.modeling_utils import init_empty_weights
+    _W8A8_FAST_LOAD_AVAILABLE = True
+except Exception:
+    Qwen3TTSConfig = None  # type: ignore[assignment]
+    Qwen3TTSForConditionalGeneration = None  # type: ignore[assignment]
+    init_empty_weights = None  # type: ignore[assignment]
+    _W8A8_FAST_LOAD_AVAILABLE = False
+
 # bitsandbytes int8 quantization config (optional hard dependency)
 try:
     from transformers import BitsAndBytesConfig
@@ -410,6 +425,96 @@ def _load_w8a8_model(source, w8a8_path, device_map="cuda", dtype=torch.bfloat16,
     state_dict = load_file(w8a8_path, device="cpu")
     model.model.load_state_dict(state_dict, strict=False)
     return model
+
+
+def _load_w8a8_model_fast(model_dir: str, w8a8_path: str, device="cuda",
+                          dtype=torch.bfloat16, attn_implementation=None,
+                          load_speech_tokenizer: bool = False):
+    """Fast W8A8 load that bypasses from_pretrained() entirely.
+
+    Reads config.json, builds an empty model skeleton via init_empty_weights()
+    (no bf16 weights allocated or transferred), then loads the pre-quantized
+    int8 state_dict directly from *_w8a8.safetensors. This avoids loading the
+    ~3.4 GB bf16 model from disk on every run — the root cause of the
+    ~10-minute load time.
+
+    Args:
+        model_dir: Local model folder containing config.json and
+                   generation_config.json.
+        w8a8_path: Path to the saved *_w8a8.safetensors checkpoint.
+        device: Target device ("cuda").
+        dtype: Compute dtype (torch.bfloat16).
+        attn_implementation: Attention backend ("sdpa", "eager", etc.).
+        load_speech_tokenizer: Only load the speech_tokenizer (needed for
+            Base model / voice cloning). Skipped for CustomVoice / VoiceDesign.
+
+    Returns:
+        Qwen3TTSModel wrapper ready for generation.
+    """
+    from safetensors.torch import load_file
+    import json
+
+    if not _W8A8_FAST_LOAD_AVAILABLE:
+        raise RuntimeError(
+            "[Qwen3-TTS] w8a8 fast load requires qwen_tts config/model classes "
+            "and transformers init_empty_weights, which are not available."
+        )
+
+    # Register custom classes so config resolution works (mirrors Qwen3TTSModel.from_pretrained)
+    from transformers import AutoConfig, AutoModel, AutoProcessor
+    AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
+    AutoModel.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
+    AutoProcessor.register(Qwen3TTSConfig, type("Qwen3TTSProcessor", (), {}))
+
+    # 1. Config only — no weights loaded from disk
+    print(f"🔧 [Qwen3-TTS] w8a8 fast: loading config from {model_dir}")
+    config = Qwen3TTSConfig.from_pretrained(model_dir, local_files_only=True)
+
+    # 2. Attention implementation
+    if attn_implementation:
+        config._attn_implementation = attn_implementation
+
+    # 3. Empty skeleton on meta device — zero memory for weights
+    print(f"🔧 [Qwen3-TTS] w8a8 fast: building empty model skeleton")
+    with init_empty_weights():
+        model = Qwen3TTSForConditionalGeneration(config)
+
+    # 4. Load int8 weights directly from the saved checkpoint
+    print(f"🚀 [Qwen3-TTS] w8a8 fast: loading int8 weights from {w8a8_path}")
+    state_dict = load_file(w8a8_path, device="cpu")
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    print(f"🔧 [Qwen3-TTS] w8a8 fast: {len(state_dict)} tensors loaded, "
+          f"missing={len(missing.missing_keys)}, unexpected={len(unexpected)}")
+
+    # 5. Move to device/dtype
+    model = model.to(dtype=dtype).to(device)
+    model.eval()
+
+    # 6. Generation config (small JSON, cheap)
+    gen_cfg_path = os.path.join(model_dir, "generation_config.json")
+    if os.path.exists(gen_cfg_path):
+        with open(gen_cfg_path, "r", encoding="utf-8") as f:
+            model.load_generate_config(json.load(f))
+
+    # 7. Speech tokenizer / processor only if voice cloning is needed
+    #    Base model needs it; CustomVoice / VoiceDesign do not.
+    processor = None
+    if load_speech_tokenizer:
+        try:
+            from qwen_tts.core.models.modeling_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizer
+            st_dir = os.path.join(model_dir, "speech_tokenizer")
+            if os.path.isdir(st_dir):
+                speech_tokenizer = Qwen3TTSTokenizer.from_pretrained(st_dir, local_files_only=True)
+                model.load_speech_tokenizer(speech_tokenizer)
+        except Exception as e:
+            print(f"⚠️ [Qwen3-TTS] w8a8 fast: speech tokenizer load skipped ({e})")
+
+    # 8. Wrap in Qwen3TTSModel (processor=None is fine for non-voice-clone paths)
+    wrap = Qwen3TTSModel(model=model, processor=processor,
+                         generate_defaults=getattr(model, "generate_config", {}))
+    print(f"🚀 [Qwen3-TTS] w8a8 fast: model ready on {device}")
+    return wrap
+
 
 
 # Register "qwen-tts" model folder for extra_model_paths.yaml support
@@ -1323,8 +1428,11 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
             w8a8_path = os.path.join(qwen_root, model_name + "_w8a8.safetensors")
             if os.path.exists(w8a8_path):
                 print(f"🔧 [Qwen3-TTS] w8a8: loading pre-quantized weights from disk: {w8a8_path}")
-                model = _load_w8a8_model(final_source, w8a8_path, device_map=device, dtype=dtype,
-                                         attn_implementation=attn_param, quantization_config=None)
+                model = _load_w8a8_model_fast(
+                    final_source, w8a8_path, device=device, dtype=dtype,
+                    attn_implementation=attn_param,
+                    load_speech_tokenizer=(model_type == "Base"),
+                )
                 w8a8_loaded = True
             else:
                 print(f"🔧 [Qwen3-TTS] w8a8: no saved weights found at {w8a8_path}; running first-time "
