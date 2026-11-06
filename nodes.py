@@ -301,8 +301,13 @@ class W8A8Linear(torch.nn.Module):
         return out.reshape(*x_q.shape[:-1], N)
 
 
-def _convert_linear_to_w8a8(model, skip_modules, convrot=True, group_size=_CONVROT_GROUP_SIZE):
-    """Convert eligible Linear modules to W8A8Linear (quantize bf16 weight -> int8 + scale).
+def _convert_linear_to_w8a8(model, skip_modules, convrot=True,
+                            group_size=_CONVROT_GROUP_SIZE, quantize=True):
+    """Convert eligible Linear modules to W8A8Linear shells.
+
+    When quantize=True (first-run path), quantize bf16 weight -> int8 + scale.
+    When quantize=False (fast-path load from checkpoint), create empty shells;
+    load_state_dict fills weight/weight_scale from the saved checkpoint.
 
     ConvRot is applied only when in_features % group_size == 0.
     """
@@ -319,15 +324,17 @@ def _convert_linear_to_w8a8(model, skip_modules, convrot=True, group_size=_CONVR
         new_module = W8A8Linear(module.in_features, module.out_features,
                                 bias=(module.bias is not None),
                                 convrot=use_convrot, group_size=group_size)
-        new_module.quantize_from_bf16(module.weight.detach())
-        if module.bias is not None:
-            new_module.bias.data = module.bias.detach().to(torch.bfloat16)
+        if quantize:
+            new_module.quantize_from_bf16(module.weight.detach())
+            if module.bias is not None:
+                new_module.bias.data = module.bias.detach().to(torch.bfloat16)
         if isinstance(parent, torch.nn.ModuleList):
             parent[int(child)] = new_module
         else:
             setattr(parent, child, new_module)
         converted += 1
-    print(f"[Qwen3-TTS] w8a8: converted {converted} Linear layers (skipped {skipped} sensitive modules).")
+    print(f"[Qwen3-TTS] w8a8: replaced {converted} Linear layers "
+          f"(skipped {skipped}; quantize={quantize}).")
     return converted
 
 
@@ -387,7 +394,8 @@ def _load_w8a8_model(source, w8a8_path, device_map="cuda", dtype=torch.bfloat16,
             group_size = int(meta.get("convrot_groupsize", _CONVROT_GROUP_SIZE))
         except Exception:
             pass
-    _convert_linear_to_w8a8(model.model, _INT8_SKIP_MODULES, convrot=convrot, group_size=group_size)
+    _convert_linear_to_w8a8(model.model, _INT8_SKIP_MODULES, convrot=convrot,
+                            group_size=group_size, quantize=False)
     if device_map != "cpu" and torch.cuda.is_available():
         model.model = model.model.cuda()
     print(f"🚀 [Qwen3-TTS] w8a8: loading fast-path quantized weights from {w8a8_path}")
@@ -1239,8 +1247,10 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
             final_source = downloaded_path
             print(f"✅ [Qwen3-TTS] Loading downloaded model: {os.path.basename(final_source)}")
         else:
-            # Fall back to remote loading if download failed
-            print(f"🌐 [Qwen3-TTS] Loading remote model: {final_source}")
+            raise RuntimeError(
+                f"❌ [Qwen3-TTS] Model '{final_source}' not found locally and auto-download failed. "
+                f"Download it manually into {qwen_root} or check network/HF access."
+            )
 
     # --- int8 pre-quantized folder check (quantize once, load from disk) ---
     int8_source = None
