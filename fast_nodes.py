@@ -334,7 +334,7 @@ class Qwen3TTSFastLoader:
                 "device": (["auto", "cuda:0", "cuda:1"],),
                 "precision": (["bf16", "fp32"],),
                 "attention": (ATTENTION_OPTIONS,),
-                "max_seq_len": ("INT", {"default": 2048, "min": 512, "max": 8192, "step": 128}),
+                "max_seq_len": ("INT", {"default": 2048, "min": 512, "max": 8192, "step": 128, "tooltip": "Static KV-cache size for CUDA-graph inference (fixed at load). Total input text + generated tokens must fit within this; max_new_tokens is clamped to max_seq_len - 256. Higher = more VRAM reserved upfront."}),
             },
             "optional": {
                 "warmup": ("BOOLEAN", {"default": True}),
@@ -434,7 +434,6 @@ class Qwen3TTSFastCustomVoice:
                 "top_p": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "top_k": ("INT", {"default": 20, "min": 0, "max": 100, "step": 1}),
                 "repetition_penalty": ("FLOAT", {"default": 1.05, "min": 1.0, "max": 2.0, "step": 0.05}),
-                "attention": (ATTENTION_OPTIONS, {"default": "auto"}),
                 "unload_model_after_generate": ("BOOLEAN", {"default": False}),
             },
         }
@@ -446,7 +445,7 @@ class Qwen3TTSFastCustomVoice:
     def generate(self, model, text, speaker, language, seed, instruct="",
                  custom_model_path="", custom_speaker_name="",
                  max_new_tokens=2048, temperature=1.0, top_p=0.8, top_k=20,
-                 repetition_penalty=1.05, attention="auto", unload_model_after_generate=False):
+                 repetition_penalty=1.05, unload_model_after_generate=False):
         m = _check(model)
         set_seed(seed)
         kw = _sampling(m, max_new_tokens, temperature, top_p, top_k, repetition_penalty)
@@ -498,7 +497,6 @@ class Qwen3TTSFastVoiceDesign:
                 "top_p": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "top_k": ("INT", {"default": 20, "min": 0, "max": 100, "step": 1}),
                 "repetition_penalty": ("FLOAT", {"default": 1.05, "min": 1.0, "max": 2.0, "step": 0.05}),
-                "attention": (ATTENTION_OPTIONS, {"default": "auto"}),
                 "unload_model_after_generate": ("BOOLEAN", {"default": False}),
             },
         }
@@ -509,7 +507,7 @@ class Qwen3TTSFastVoiceDesign:
 
     def generate(self, model, text, instruct, language, seed,
                  max_new_tokens=2048, temperature=1.0, top_p=0.8, top_k=20,
-                 repetition_penalty=1.05, attention="auto", unload_model_after_generate=False):
+                 repetition_penalty=1.05, unload_model_after_generate=False):
         m = _check(model)
         set_seed(seed)
         kw = _sampling(m, max_new_tokens, temperature, top_p, top_k, repetition_penalty)
@@ -557,7 +555,6 @@ class Qwen3TTSFastVoiceClone:
                 "top_p": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "top_k": ("INT", {"default": 20, "min": 0, "max": 100, "step": 1}),
                 "repetition_penalty": ("FLOAT", {"default": 1.05, "min": 1.0, "max": 2.0, "step": 0.05}),
-                "attention": (ATTENTION_OPTIONS, {"default": "auto"}),
                 "unload_model_after_generate": ("BOOLEAN", {"default": False}),
             },
         }
@@ -569,7 +566,7 @@ class Qwen3TTSFastVoiceClone:
     def generate(self, model, text, ref_audio, ref_text, language, seed, x_vector_only=False,
                  custom_model_path="", voice_clone_prompt=None,
                  max_new_tokens=2048, temperature=1.0, top_p=0.8, top_k=20,
-                 repetition_penalty=1.05, attention="auto", unload_model_after_generate=False):
+                 repetition_penalty=1.05, unload_model_after_generate=False):
         m = _check(model)
         set_seed(seed)
         kw = _sampling(m, max_new_tokens, temperature, top_p, top_k, repetition_penalty)
@@ -629,7 +626,6 @@ class Qwen3TTSFastVoiceCloneFromFile:
                 "top_p": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "top_k": ("INT", {"default": 20, "min": 0, "max": 100, "step": 1}),
                 "repetition_penalty": ("FLOAT", {"default": 1.05, "min": 1.0, "max": 2.0, "step": 0.05}),
-                "attention": (ATTENTION_OPTIONS, {"default": "auto"}),
                 "unload_model_after_generate": ("BOOLEAN", {"default": False}),
             },
         }
@@ -640,7 +636,7 @@ class Qwen3TTSFastVoiceCloneFromFile:
 
     def generate(self, model, text, ref_audio_path, ref_text, language, seed, x_vector_only=False,
                  max_new_tokens=2048, temperature=1.0, top_p=0.8, top_k=20,
-                 repetition_penalty=1.05, attention="auto", unload_model_after_generate=False):
+                 repetition_penalty=1.05, unload_model_after_generate=False):
         m = _check(model)
         if not os.path.isfile(ref_audio_path):
             raise RuntimeError(f"Reference audio not found: {ref_audio_path}")
@@ -716,7 +712,6 @@ class Qwen3TTSFastCloneWithPrompt:
                 "top_p": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "top_k": ("INT", {"default": 20, "min": 0, "max": 100, "step": 1}),
                 "repetition_penalty": ("FLOAT", {"default": 1.05, "min": 1.0, "max": 2.0, "step": 0.05}),
-                "attention": (ATTENTION_OPTIONS, {"default": "auto"}),
                 "unload_model_after_generate": ("BOOLEAN", {"default": False}),
             },
         }
@@ -727,7 +722,7 @@ class Qwen3TTSFastCloneWithPrompt:
 
     def generate(self, model, text, clone_prompt, language, seed,
                  max_new_tokens=2048, temperature=1.0, top_p=0.8, top_k=20,
-                 repetition_penalty=1.05, attention="auto", unload_model_after_generate=False):
+                 repetition_penalty=1.05, unload_model_after_generate=False):
         m = _check(model)
         set_seed(seed)
         kw = _sampling(m, max_new_tokens, temperature, top_p, top_k, repetition_penalty)
@@ -775,7 +770,6 @@ class Qwen3TTSFastBatchGenerate:
                 "top_p": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "top_k": ("INT", {"default": 20, "min": 0, "max": 100, "step": 1}),
                 "repetition_penalty": ("FLOAT", {"default": 1.05, "min": 1.0, "max": 2.0, "step": 0.05}),
-                "attention": (ATTENTION_OPTIONS, {"default": "auto"}),
                 "unload_model_after_generate": ("BOOLEAN", {"default": False}),
             },
         }
@@ -788,7 +782,7 @@ class Qwen3TTSFastBatchGenerate:
     def generate_batch(self, model, text_list, separator, language, seed,
                        speaker="Vivian", clone_prompt=None, increment_seed=True,
                        max_new_tokens=2048, temperature=1.0, top_p=0.8, top_k=20,
-                       repetition_penalty=1.05, attention="auto", unload_model_after_generate=False):
+                       repetition_penalty=1.05, unload_model_after_generate=False):
         m = _check(model)
         sep = separator if separator else "\n"
         texts = [t.strip() for t in text_list.split(sep) if t.strip()]
