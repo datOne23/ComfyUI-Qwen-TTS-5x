@@ -32,19 +32,33 @@ def unload_cached_model(cache_key=None):
         models_to_unload = list(constants._MODEL_CACHE.values())
         constants._MODEL_CACHE.clear()
 
-    # Move inner models to CPU and null out ALL references so CUDA tensors are freed
+    inner = None
+    # Break every reference holding CUDA/CPU tensors so the model object becomes
+    # collectable (weights freed from both VRAM and RAM) before empty_cache() runs.
     for model in models_to_unload:
+        # Break the wrapper self-cycle introduced by apply_qwen3_patches: a bound
+        # MethodType references the wrapper itself, keeping it alive past GC.
+        try:
+            if hasattr(model, "_normalize_audio_inputs"):
+                del model._normalize_audio_inputs
+        except Exception:
+            pass
         try:
             if hasattr(model, "model") and model.model is not None:
                 inner = model.model
-                # Clear speech tokenizer if loaded (holds CPU/RAM references)
+                # Clear non-tensor references first
                 if hasattr(inner, "speech_tokenizer") and inner.speech_tokenizer is not None:
                     inner.speech_tokenizer = None
                 if hasattr(inner, "generate_config"):
                     inner.generate_config = None
-                if hasattr(inner, "cpu"):
-                    inner.cpu()  # in-place: frees CUDA tensors
+                # Drop the wrapper's reference to the inner model BEFORE moving to
+                # CPU, so a cpu() failure cannot leave a dangling CUDA reference.
                 model.model = None
+                # Relocate weights off CUDA so empty_cache() can reclaim VRAM.
+                if hasattr(inner, "cpu"):
+                    inner.cpu()
+                # Drop our local reference so GC can collect the whole model.
+                inner = None
         except Exception:
             pass
         try:
@@ -62,6 +76,9 @@ def unload_cached_model(cache_key=None):
         except Exception:
             pass
 
+    # Ensure no lingering local reference to the last inner model survives
+    # past the GC/empty_cache calls below.
+    inner = None
     del models_to_unload
 
     import gc

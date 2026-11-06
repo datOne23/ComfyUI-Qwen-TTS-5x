@@ -15,8 +15,8 @@ import torch
 # Force offline mode for HuggingFace Hub *before* anything imports transformers.
 # local_files_only=True alone is not sufficient on Windows (transformers #43502
 # — from_pretrained still hits /api/models/.../revision/main).
-os.environ.setdefault("HF_HUB_OFFLINE", "true")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "true")
+os.environ.setdefault("HF_HUB_OFFLINE", "false")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "false")
 
 # --- Path computation -----------------------------------------------------
 # This file lives one level deeper than the old nodes.py (.../nodes/_boot.py),
