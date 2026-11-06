@@ -1022,14 +1022,19 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
             if not os.path.exists(int8_folder):
                 print(f"💾 [Qwen3-TTS] Saving int8 model to: {int8_folder}")
                 os.makedirs(int8_folder, exist_ok=True)
-                torch.save(model.model.state_dict(), os.path.join(int8_folder, "pytorch_model.bin"))
-                if hasattr(model, 'processor') and model.processor is not None:
+                # Move tensors to CPU before saving (bitsandbytes compatibility)
+                sd = model.model.state_dict()
+                cpu_sd = {k: v.cpu() if hasattr(v, "cpu") else v for k, v in sd.items()}
+                torch.save(cpu_sd, os.path.join(int8_folder, "pytorch_model.bin"))
+                if hasattr(model, "processor") and model.processor is not None:
                     model.processor.save_pretrained(int8_folder)
-                if hasattr(model.model, 'config'):
+                if hasattr(model.model, "config"):
                     model.model.config.save_pretrained(int8_folder)
                 print(f"✅ [Qwen3-TTS] int8 model state saved.")
         except Exception as e:
-            print(f"⚠️ [Qwen3-TTS] Failed to save int8 model state: {e}")
+            import traceback
+            print(f"⚠️ [Qwen3-TTS] Failed to save int8 model state: {type(e).__name__}: {e}")
+            traceback.print_exc()
     
     if unload_after:
         def unload_callback():
