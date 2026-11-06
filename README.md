@@ -179,8 +179,9 @@ Ready-to-use workflows are in [`example/`](example/):
 - 🎯 **Multilingual**: Native support for 10 languages (Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, and Italian).
 - ⚡ **Integrated Loading**: No separate loader nodes required; model loading is managed on-demand with global caching.
 - ⏱️ **Ultra-Low Latency**: Supports high-fidelity speech reconstruction with low-latency streaming.
-- 🧠 **Attention Mechanism Selection**: Choose from multiple attention implementations (sage_attn, flash_attn, sdpa, eager) with auto-detection and graceful fallback.
+- 🧠 **Attention Mechanism Selection**: Choose from multiple attention implementations (sage_attn, flash_attn, xformers, comfy_kitchen, sdpa, eager) with auto-detection and graceful fallback.
 - 💾 **Memory Management**: Optional model unloading after generation to free GPU memory for users with limited VRAM.
+- 🏷️ **Inline Bracket Tags**: Embed descriptive delivery instructions directly in text using bracket tags (e.g. `[Speak in a bubbly, slightly high-pitched tone]`) — supported on all generator nodes.
 
 ## Nodes List
 
@@ -190,7 +191,7 @@ Generate unique voices based on text descriptions.
   - `text`: Target text to synthesize.
   - `instruct`: Description of the voice (e.g., "A gentle female voice with a high pitch").
   - `model_choice`: Currently locked to **1.7B** for VoiceDesign features.
-  - `attention`: Attention mechanism (auto, sage_attn, flash_attn, sdpa, eager).
+  - `attention`: Attention mechanism (auto, sage_attn, flash_attn, xformers, comfy_kitchen, sdpa, eager).
   - `unload_model_after_generate`: Unload model from memory after generation to free GPU memory.
 - **Capabilities**: Best for creating "imaginary" voices or specific character archetypes.
 
@@ -201,7 +202,7 @@ Clone a voice from a reference audio clip.
   - `ref_text`: Text spoken in the `ref_audio` (helps improve quality).
   - `target_text`: The new text you want the cloned voice to say.
   - `model_choice`: Choose between **0.6B** (fast) or **1.7B** (high quality).
-  - `attention`: Attention mechanism (auto, sage_attn, flash_attn, sdpa, eager).
+  - `attention`: Attention mechanism (auto, sage_attn, flash_attn, xformers, comfy_kitchen, sdpa, eager).
   - `unload_model_after_generate`: Unload model from memory after generation to free GPU memory.
 
 ### 3. Qwen3-TTS Custom Voice (`CustomVoiceNode`)
@@ -210,7 +211,7 @@ Standard TTS using preset speakers.
   - `text`: Target text.
   - `speaker`: Selection from preset voices (Aiden, Eric, Serena, etc.).
   - `instruct`: Optional style instructions.
-  - `attention`: Attention mechanism (auto, sage_attn, flash_attn, sdpa, eager).
+  - `attention`: Attention mechanism (auto, sage_attn, flash_attn, xformers, comfy_kitchen, sdpa, eager).
   - `unload_model_after_generate`: Unload model from memory after generation to free GPU memory.
 
 ### 4. Qwen3-TTS Role Bank (`RoleBankNode`) [New]
@@ -227,7 +228,7 @@ Extract and reuse voice features from reference audio.
   - `ref_audio`: A short (5-15s) audio clip to extract features from.
   - `ref_text`: Text spoken in the `ref_audio` (highly recommended for better quality).
   - `model_choice`: Choose between **0.6B** (fast) or **1.7B** (high quality).
-  - `attention`: Attention mechanism (auto, sage_attn, flash_attn, sdpa, eager).
+  - `attention`: Attention mechanism (auto, sage_attn, flash_attn, xformers, comfy_kitchen, sdpa, eager).
   - `unload_model_after_generate`: Unload model from memory after generation to free GPU memory.
 - **Capabilities**: Extract a "prompt item" once and use it multiple times across different `VoiceCloneNode` instances for faster and more consistent generation.
 
@@ -237,7 +238,7 @@ Synthesize complex dialogues with multiple speakers.
   - `script`: Dialogue script in format "RoleName: Text".
   - `role_bank`: Role bank from `RoleBankNode` containing voice prompts.
   - `model_choice`: Choose between **0.6B** (fast) or **1.7B** (high quality).
-  - `attention`: Attention mechanism (auto, sage_attn, flash_attn, sdpa, eager).
+  - `attention`: Attention mechanism (auto, sage_attn, flash_attn, xformers, comfy_kitchen, sdpa, eager).
   - `unload_model_after_generate`: Unload model from memory after generation to free GPU memory.
   - `pause_seconds`: Silence duration between sentences.
   - `merge_outputs`: Merge all dialogue segments into a single long audio.
@@ -259,7 +260,9 @@ All nodes support multiple attention implementations with automatic detection an
 | Mechanism | Description | Speed | Installation |
 |-----------|-------------|-------|--------------|
 | **sage_attn** | SAGE attention implementation | ⚡⚡⚡ Fastest | `pip install sage_attn` |
+| **comfy_kitchen** | Comfy Kitchen int8 attention (requires `--use-ck-attention`) | ⚡⚡⚡ Fastest | Bundled with ComfyUI portable |
 | **flash_attn** | Flash Attention 2 | ⚡⚡ Fast | `pip install flash_attn` |
+| **xformers** | xFormers memory-efficient attention | ⚡⚡ Fast | `pip install xformers` |
 | **sdpa** | Scaled Dot Product Attention (PyTorch built-in) | ⚡ Medium | Built-in (no installation) |
 | **eager** | Standard attention (fallback) | 🐢 Slowest | Built-in (no installation) |
 | **auto** | Automatically selects best available option | Varies | N/A |
@@ -268,9 +271,11 @@ All nodes support multiple attention implementations with automatic detection an
 
 When `attention: "auto"` is selected, the system checks in this order:
 1. **sage_attn** → If installed, use SAGE attention (fastest)
-2. **flash_attn** → If installed, use Flash Attention 2
-3. **sdpa** → Always available (PyTorch built-in)
-4. **eager** → Always available (fallback, slowest)
+2. **comfy_kitchen** → If Comfy Kitchen int8 attention is available, use it (fastest)
+3. **flash_attn** → If installed, use Flash Attention 2
+4. **xformers** → If installed, use xFormers
+5. **sdpa** → Always available (PyTorch built-in)
+6. **eager** → Always available (fallback, slowest)
 
 The selected mechanism is logged to the console for transparency.
 
@@ -306,6 +311,36 @@ The `unload_model_after_generate` toggle is available on all nodes:
 🗑️ [Qwen3-TTS] Unloading 1 cached model(s)...
 ✅ [Qwen3-TTS] Model cache and GPU memory cleared
 ```
+
+## Inline Bracket Tag Support
+
+Embed descriptive instructions directly in the `text` input using inline bracket tags. Anything enclosed in brackets is treated as a delivery instruction (not spoken aloud) and applies to the text that follows.
+
+### Descriptive Tags
+
+Use natural-language descriptions inside brackets to control tone, style, pacing, or emotion:
+
+| Tag | Description |
+|-----|-------------|
+| `[Speak in a bubbly, slightly high-pitched tone]` | Light, upbeat delivery |
+| `[Speak slowly and clearly]` | Deliberate, enunciated pacing |
+| `[Whisper softly]` | Quiet, intimate delivery |
+| `[Speak with excitement]` | Energetic, enthusiastic delivery |
+| `[Speak in a calm, professional tone]` | Neutral, businesslike delivery |
+| `[Speak with a hint of sarcasm]` | Dry, ironic delivery |
+
+You can use any free-form description — the model will interpret it to adjust prosody and style.
+
+Example:
+```
+Hello [Speak in a bubbly, slightly high-pitched tone] I'm doing great today! [Speak slowly and clearly] But tomorrow is another day.
+```
+
+### Behavior
+- Tags are stripped from the spoken text; they do not appear in the output audio.
+- Multiple tags can be chained: `[Speak slowly][Whisper softly]`.
+- Tags apply to all text following them until the next tag or end of input.
+- Works on all generator nodes: VoiceDesign, VoiceClone, CustomVoice, VoiceClonePrompt, DialogueInference.
 
 
 
@@ -373,7 +408,7 @@ absolute location is printed in the console), so it can be pasted straight into
 - **Local Models**: Pre-download weights to `models/qwen-tts/` to prioritize local loading and avoid HuggingFace timeouts.
 
 ### Attention Mechanisms
-- **Best Performance**: Install `sage_attn` or `flash_attn` for 2-3x speedup over sdpa.
+- **Best Performance**: Install `sage_attn`, `flash_attn`, or `xformers` for 2-3x speedup over sdpa. ComfyUI portable bundles `comfy_kitchen` (enable with `--use-ck-attention`).
 - **Compatibility**: Use `sdpa` (default) for maximum compatibility - no installation required.
 - **Low VRAM**: Use `eager` with smaller models (0.6B) if other mechanisms cause OOM errors.
 
