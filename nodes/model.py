@@ -37,6 +37,11 @@ def unload_cached_model(cache_key=None):
         try:
             if hasattr(model, "model") and model.model is not None:
                 inner = model.model
+                # Clear speech tokenizer if loaded (holds CPU/RAM references)
+                if hasattr(inner, "speech_tokenizer") and inner.speech_tokenizer is not None:
+                    inner.speech_tokenizer = None
+                if hasattr(inner, "generate_config"):
+                    inner.generate_config = None
                 if hasattr(inner, "cpu"):
                     inner.cpu()  # in-place: frees CUDA tensors
                 model.model = None
@@ -59,15 +64,19 @@ def unload_cached_model(cache_key=None):
 
     del models_to_unload
 
+    import gc
+    gc.collect()
+    gc.collect()
+
     model_management.soft_empty_cache()
     if torch.cuda.is_available():
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
         try:
             torch.cuda.ipc_collect()
         except Exception:
             pass
 
-    import gc
     gc.collect()
     gc.collect()
     gc.collect()
