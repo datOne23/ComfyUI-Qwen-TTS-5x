@@ -919,7 +919,9 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
         int8_folder = os.path.join(qwen_root, model_name + "_int8")
         if os.path.isdir(int8_folder) and os.path.exists(os.path.join(int8_folder, "pytorch_model.bin")):
             int8_source = int8_folder
-            print(f"🔧 [Qwen3-TTS] Found pre-quantized int8 model at: {int8_folder}")
+            print(f"🔧 [Qwen3-TTS] int8: loading pre-quantized weights from disk: {int8_folder}")
+        else:
+            print(f"🔧 [Qwen3-TTS] int8: no saved weights found at {int8_folder}, will re-quantize on load")
 
     if Qwen3TTSModel is None:
         raise RuntimeError(
