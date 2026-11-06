@@ -125,6 +125,10 @@ def _load_int8_model(source, int8_source, **kwargs):
         try:
             model = _load_model_with_int8(source, **load_kwargs)
             _convert_linear_to_int8(model.model, _INT8_SKIP_MODULES)
+            # bitsandbytes Linear8bitLt must be on CUDA before loading quantized state_dict
+            target_device = kwargs.get("device_map", "cuda")
+            if target_device != "cpu":
+                model.model = model.model.to(target_device)
             state_dict = torch.load(os.path.join(int8_source, "pytorch_model.bin"), map_location="cpu")
             model.model.load_state_dict(state_dict, strict=False)
             print("Loaded pre-quantized int8 weights from disk (skipped re-quantization)")
