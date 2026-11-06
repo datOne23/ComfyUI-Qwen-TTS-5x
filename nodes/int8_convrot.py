@@ -1,16 +1,31 @@
-"""INT8-ConvRot dequantize-and-load path for Qwen3-TTS.
+"""INT8-ConvRot load path for Qwen3-TTS.
 
 Loads a pre-converted *_int8_convrot.safetensors checkpoint (produced by
-comfy-model-tools/quant_int8_convrot.py), dequantizes each int8+convrot layer
-to bf16 via comfy-kitchen, and loads into Qwen3TTSForConditionalGeneration.
+comfy-model-tools/quant_int8_convrot.py), and loads into
+Qwen3TTSForConditionalGeneration.
+
+Two modes:
+
+  (a) W8A8 forward path (opt-in via Qwen3TTS_INT8_W8A8=1):
+      Wraps on-disk INT8 weights as comfy_kitchen QuantizedTensor with
+      TensorWiseINT8Layout and convrot groupsize. Inference dispatches
+      through comfy_kitchen.int8_linear(convrot=True) -> torch._int_mm on
+      INT8 tensor cores — no dequantization at inference. Measured: ~38%
+      less VRAM, ~26% slower end-to-end on RTX 3060 batch=1.
+
+  (b) bf16 dequant path (default, Qwen3TTS_INT8_W8A8=0):
+      Dequantizes each int8+convrot layer to `dtype` via
+      _dequantize_convrot and loads as regular parameters.
+
 Optionally auto-converts on first load when no checkpoint exists on disk.
 
 Dequantization runs on the GPU (safe_open device="cuda"), the Hadamard matrix
 is cached per (groupsize, device, dtype), comfy_quant metadata is pre-scanned
 on CPU, TTSProgress is driven during the load, missing keys raise loudly, and
-the Hadamard cache is cleared between loads. Peak GPU during load is the full
-bf16 model (~3.4 GB for 1.7B) since dequantized tensors accumulate in a dict
-until load_state_dict(assign=True) swaps in pointers.
+the Hadamard cache is cleared between loads. Peak GPU during load with the
+dequant path is the full bf16 model (~3.4 GB for 1.7B) since dequantized
+tensors accumulate in a dict until load_state_dict(assign=True) swaps in
+pointers.
 """
 
 import json
@@ -72,8 +87,8 @@ def _decode_comfy_quant(raw):
     return json.loads(text)
 
 
-def _dequantize_convrot(qd, scale, gs, device):
-    """Dequantize an int8+convrot weight to bf16, entirely on `device`.
+def _dequantize_convrot(qd, scale, gs, device, out_dtype=torch.bfloat16):
+    """Dequantize an int8+convrot weight to `out_dtype`, entirely on `device`.
 
     Approach A: comfy_kitchen TensorWiseINT8Layout.dequantize (preferred).
     Approach B: manual _build_hadamard + _rotate_weight inverse (fallback).
@@ -85,16 +100,15 @@ def _dequantize_convrot(qd, scale, gs, device):
 
     if _COMFY_KITCHEN_AVAILABLE and TensorWiseINT8Layout is not None and not _FALLBACK_LOGGED:
         try:
-            from comfy_kitchen.tensor import QuantizedTensor  # noqa: F401
             params = TensorWiseINT8Layout.Params(
                 scale=scale,
-                orig_dtype=torch.bfloat16,
+                orig_dtype=out_dtype,
                 orig_shape=tuple(qd.shape),
                 convrot=True,
                 convrot_groupsize=gs,
             )
             deq = TensorWiseINT8Layout.dequantize(qd, params)
-            return deq.to(device=device, dtype=torch.bfloat16, non_blocking=True)
+            return deq.to(device=device, dtype=out_dtype, non_blocking=True)
         except Exception as e:
             _FALLBACK_LOGGED = True
             print(
@@ -103,17 +117,17 @@ def _dequantize_convrot(qd, scale, gs, device):
             )
 
     # Approach B: manual Hadamard inverse rotation (H is self-inverse).
-    # Rotate in bf16 before applying the per-tensor scalar scale; scale
+    # Rotate in out_dtype before applying the per-tensor scalar scale; scale
     # commutes with the rotation so this is mathematically equivalent to
     # dequant-then-rotate-then-scale.
-    cache_key = (gs, str(device), torch.bfloat16)
+    cache_key = (gs, str(device), out_dtype)
     h = _HADAMARD_CACHE.get(cache_key)
     if h is None:
-        h = _build_hadamard(gs, device=device, dtype=torch.bfloat16)
+        h = _build_hadamard(gs, device=device, dtype=out_dtype)
         _HADAMARD_CACHE[cache_key] = h
-    deq = qd.to(torch.bfloat16)
+    deq = qd.to(out_dtype)
     deq = _rotate_weight(deq, h, gs)
-    deq = deq * scale.to(torch.bfloat16)
+    deq = deq * scale.to(out_dtype)
     return deq
 
 
@@ -144,6 +158,17 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
     attn_implementation = kwargs.get("attn_implementation")
     load_speech_tokenizer = kwargs.get("load_speech_tokenizer", False)
     auto_convert = kwargs.get("auto_convert", False)
+
+    # Resolve compute dtype from the `dtype` argument (bf16 default).
+    if isinstance(dtype, torch.dtype):
+        out_dtype = dtype
+    else:
+        _DTYPE_MAP = {
+            "bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
+            "fp16": torch.float16,  "float16":  torch.float16,
+            "fp32": torch.float32,  "float32":  torch.float32,
+        }
+        out_dtype = _DTYPE_MAP.get(str(dtype).lower(), torch.bfloat16)
 
     # Clear any Hadamard matrices left over from a previous load with a
     # different groupsize, so they don't sit in VRAM forever.
@@ -295,7 +320,10 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
             pbar = None
 
         done = 0
-        use_w8a8 = os.environ.get("Qwen3TTS_INT8_W8A8", "1") == "1"
+        # Default is the bf16 dequant path (W8A8 measured 1.26x slower end-to-end
+        # on RTX 3060 batch=1). Set Qwen3TTS_INT8_W8A8=1 to opt into the INT8
+        # forward path (saves ~38% VRAM, does not speed up generation).
+        use_w8a8 = os.environ.get("Qwen3TTS_INT8_W8A8", "0") == "1"
         for key in plain_keys:
             base = key[:-len(".weight")] if key.endswith(".weight") else None
             if base is not None and base in quantized_bases:
@@ -304,19 +332,19 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
                 gs = groupsize_map[base]
                 if not use_w8a8:
                     # Kill switch: dequantize to bf16 end to end.
-                    state_dict[key] = _dequantize_convrot(qd, scale, gs, st_device)
+                    state_dict[key] = _dequantize_convrot(qd, scale, gs, st_device, out_dtype=out_dtype)
                 else:
                     try:
                         qt = QuantizedTensor(
                             qdata=qd,
                             layout_cls="TensorWiseINT8Layout",
-                            params=TensorWiseINT8Layout.Params(
-                                scale=scale.to(torch.float32),
-                                orig_dtype=torch.bfloat16,
-                                orig_shape=tuple(qd.shape),
-                                convrot=True,
-                                convrot_groupsize=gs,
-                            ),
+                    params=TensorWiseINT8Layout.Params(
+                        scale=scale.to(torch.float32),
+                        orig_dtype=out_dtype,
+                        orig_shape=tuple(qd.shape),
+                        convrot=True,
+                        convrot_groupsize=gs,
+                    ),
                         )
                         state_dict[key] = qt
                     except Exception as e:
