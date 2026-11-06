@@ -54,21 +54,87 @@ except Exception:
     _DICT_KEYS_DISPATCH_PATCHED = False
 
 
+# Modules that must stay in bf16 (sensitive to the bf16->fp16 cast bitsandbytes
+# applies during quantized matmul). Kept in sync with the skip list used to
+# build BitsAndBytesConfig in load_qwen_model.
+_INT8_SKIP_MODULES = [
+    "lm_head",
+    "output_proj",
+    "codec_encoder",
+    "codec_decoder",
+    "speaker_encoder",
+    "vocoder",
+    "seanet",
+    "audio_codec",
+    "decoder",
+    "feature_projection",
+]
+
+
+def _get_parent_module(model, target_name):
+    """Return (parent_module, child_name_or_index) for a dotted module path."""
+    parts = target_name.split(".")
+    parent = model
+    for part in parts[:-1]:
+        parent = parent[int(part)] if part.isdigit() else getattr(parent, part)
+    child = parts[-1]
+    return parent, child
+
+
+def _convert_linear_to_int8(model, skip_modules):
+    """Convert eligible Linear modules to bnb.nn.Int8Linear so a pre-quantized
+    state_dict (weight.int8 + weight.SCB) can be loaded without re-quantizing."""
+    import bitsandbytes as bnb
+
+    for name, module in list(model.named_modules()):
+        if not isinstance(module, torch.nn.Linear):
+            continue
+        if any(skip in name for skip in skip_modules):
+            continue
+        parent, child = _get_parent_module(model, name)
+        new_module = bnb.nn.Int8Linear(
+            module.in_features,
+            module.out_features,
+            bias=(module.bias is not None),
+        )
+        if isinstance(parent, torch.nn.ModuleList):
+            parent[int(child)] = new_module
+        else:
+            setattr(parent, child, new_module)
+
+
 def _load_model_with_int8(source, **kwargs):
     """Load model with bitsandbytes int8 (dict_keys deepcopy handled via dispatch table)."""
     return Qwen3TTSModel.from_pretrained(source, **kwargs)
 
 
 def _load_int8_model(source, int8_source, **kwargs):
-    """Load model with bitsandbytes int8, optionally overriding with saved state dict."""
-    model = _load_model_with_int8(source, **kwargs)
-    if int8_source:
+    """Load model with bitsandbytes int8.
+
+    When int8_source (a saved *_int8/pytorch_model.bin) is provided, load the
+    plain bf16 model WITHOUT quantization_config (skipping the outlier scan +
+    int8 conversion), convert eligible Linear modules to Int8Linear, and load
+    the pre-quantized state_dict from disk. This is the fast path.
+
+    When int8_source is None (first load), quantize on the fly via
+    quantization_config (the slow path).
+    """
+    if int8_source and _BITSANDBYTES_AVAILABLE:
+        # Fast path: load pre-quantized weights from disk, skip re-quantization
+        load_kwargs = {k: v for k, v in kwargs.items() if k != "quantization_config"}
         try:
+            model = _load_model_with_int8(source, **load_kwargs)
+            _convert_linear_to_int8(model.model, _INT8_SKIP_MODULES)
             state_dict = torch.load(os.path.join(int8_source, "pytorch_model.bin"), map_location="cpu")
-            model.model.load_state_dict(state_dict)
-            print(f"🔧 [Qwen3-TTS] Loaded saved int8 weights from: {int8_source}")
+            model.model.load_state_dict(state_dict, strict=False)
+            print("Loaded pre-quantized int8 weights from disk (skipped re-quantization)")
+            return model
         except Exception as e:
-            print(f"⚠️ [Qwen3-TTS] Failed to load saved int8 weights: {e}")
+            print(f"⚠️ [Qwen3-TTS] Fast int8 load from {int8_source} failed ({e}); falling back to quantize-on-load.")
+            model = _load_model_with_int8(source, **kwargs)
+            return model
+    # Slow path (first time): quantize on the fly with quantization_config
+    model = _load_model_with_int8(source, **kwargs)
     return model
 
 # Register "qwen-tts" model folder for extra_model_paths.yaml support
@@ -831,18 +897,7 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
                 # Qwen3-TTS has Talker + Code Predictor + Speaker Encoder + Codec/Vocoder;
                 # the codec/vocoder/speaker-encoder layers are sensitive to the bf16->fp16 cast
                 # that bitsandbytes applies during quantized matmul. Keep them in bf16.
-                skip_modules = [
-                    "lm_head",
-                    "output_proj",
-                    "codec_encoder",
-                    "codec_decoder",
-                    "speaker_encoder",
-                    "vocoder",
-                    "seanet",
-                    "audio_codec",
-                    "decoder",
-                    "feature_projection",
-                ]
+                skip_modules = _INT8_SKIP_MODULES
                 quant_config = BitsAndBytesConfig(
                     load_in_8bit=True,
                     llm_int8_skip_modules=skip_modules,
@@ -926,6 +981,9 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
             print(f"🔧 [Qwen3-TTS] int8: loading pre-quantized weights from disk: {int8_folder}")
         else:
             print(f"🔧 [Qwen3-TTS] int8: no saved weights found at {int8_folder}, will re-quantize on load")
+
+    if quantization == "int8" and int8_source is None:
+        print("int8 first load may take ~2-3 minutes (one-time quantization); subsequent generations are cached.")
 
     if Qwen3TTSModel is None:
         raise RuntimeError(
@@ -1038,8 +1096,10 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
                 torch.save(cpu_sd, os.path.join(int8_folder, "pytorch_model.bin"))
                 if hasattr(model, "processor") and model.processor is not None:
                     model.processor.save_pretrained(int8_folder)
-                if hasattr(model.model, "config"):
-                    model.model.config.save_pretrained(int8_folder)
+                # Save config.json unconditionally so *_int8/ is a self-contained checkpoint
+                model.model.config.save_pretrained(int8_folder)
+                if hasattr(model.model, "generation_config") and model.model.generation_config is not None:
+                    model.model.generation_config.save_pretrained(int8_folder)
                 print(f"✅ [Qwen3-TTS] int8 model state saved.")
         except Exception as e:
             import traceback
