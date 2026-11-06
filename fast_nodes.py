@@ -271,6 +271,14 @@ def _timed(fn):
 def _check(model):
     if not isinstance(model, FastTTSModel):
         raise RuntimeError("Connect the 'Qwen3 TTS Fast Loader' node to the model input.")
+    if not model.fast.predictor_graph.captured or not model.fast.talker_graph.captured:
+        raise RuntimeError(
+            "CUDA graphs were not captured (warmup failed or disabled). "
+            "This can happen when cudaMallocAsync is enabled or the GPU "
+            "doesn't support graph capture. Either retry with warmup=True "
+            "on a compatible setup, or use the standard FB_Qwen3TTS* nodes "
+            "which don't require CUDA graphs."
+        )
     return model
 
 
@@ -337,7 +345,7 @@ class Qwen3TTSFastLoader:
                 "max_seq_len": ("INT", {"default": 2048, "min": 512, "max": 8192, "step": 128, "tooltip": "Static KV-cache size for CUDA-graph inference (fixed at load). Total input text + generated tokens must fit within this; max_new_tokens is clamped to max_seq_len - 256. Higher = more VRAM reserved upfront."}),
             },
             "optional": {
-                "warmup": ("BOOLEAN", {"default": True}),
+                "warmup": ("BOOLEAN", {"default": False}),
             },
         }
 
@@ -404,8 +412,14 @@ class Qwen3TTSFastLoader:
         if warmup:
             print("[Qwen3-TTS Fast] Capturing CUDA graphs...")
             t0 = time.time()
-            fast.warmup()
-            print(f"[Qwen3-TTS Fast] Graphs captured in {time.time() - t0:.1f}s")
+            try:
+                fast.warmup()
+                print(f"[Qwen3-TTS Fast] Graphs captured in {time.time() - t0:.1f}s")
+            except Exception as warmup_exc:
+                print(f"[Qwen3-TTS Fast] WARNING: CUDA graph warmup failed: {warmup_exc}")
+                print("[Qwen3-TTS Fast] The model loaded but graphs were not captured.")
+                print("[Qwen3-TTS Fast] Use warmup=False to skip graph capture, or switch to FB_Qwen3TTS* nodes.")
+                fast._warmed_up = True  # prevent generate() from retrying warmup
 
         handle = FastTTSModel(fast, model_name, int(max_seq_len))
         _FAST_MODEL_CACHE[key] = handle

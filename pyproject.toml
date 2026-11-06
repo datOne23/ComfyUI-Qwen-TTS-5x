@@ -5,7 +5,7 @@ name = "ComfyUI-Qwen-TTS-5x"  # Unique identifier (immutable after creation)
 # NB: the node CLASS names (FB_Qwen3TTS*) are identical to upstream, so the
 # two packages must not be enabled at the same time.
 description = "ComfyUI custom nodes for Qwen3-TTS, patched for transformers 5.x compatibility (verified on 5.14.1)"
-version = "1.0.8"  # Semantic versioning
+version = "1.0.9"  # Semantic versioning
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
 dependencies = [
