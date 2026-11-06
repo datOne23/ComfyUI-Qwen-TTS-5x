@@ -14,3 +14,7 @@ onnxruntime
 onnxruntime-gpu
 safetensors
 scipy>=1.11.0
+
+# Optional: bitsandbytes for int8 (LLM.int8()) quantization.
+# Not auto-installed on Windows — install the matching CUDA wheel manually.
+# bitsandbytes

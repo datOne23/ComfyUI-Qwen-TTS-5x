@@ -19,6 +19,14 @@ try:
 except Exception:  # model layer unavailable; progress degrades to coarse phases
     set_progress_hook = None
 
+# bitsandbytes int8 quantization config (optional hard dependency)
+try:
+    from transformers import BitsAndBytesConfig
+    _BITSANDBYTES_AVAILABLE = True
+except Exception:
+    BitsAndBytesConfig = None  # type: ignore[assignment]
+    _BITSANDBYTES_AVAILABLE = False
+
 # Register "qwen-tts" model folder for extra_model_paths.yaml support
 try:
     folder_paths.add_model_folder_path("qwen-tts", os.path.join(folder_paths.models_dir, "qwen-tts"))
@@ -724,7 +732,7 @@ def check_and_download_tokenizer():
     _MODELS_CHECKED = True
 
 
-def load_qwen_model(model_type: str, model_choice: str, device: str, precision: str, attention: str = "auto", unload_after: bool = False, previous_attention: str = None, custom_model_path: Optional[str] = None):
+def load_qwen_model(model_type: str, model_choice: str, device: str, precision: str, quantization: str = "none", attention: str = "auto", unload_after: bool = False, previous_attention: str = None, custom_model_path: Optional[str] = None):
     """Shared model loading logic with caching and local path priority"""
     global _MODEL_CACHE
     
@@ -762,8 +770,24 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
     if model_type == "VoiceDesign" and model_choice == "0.6B":
         raise RuntimeError("❌ VoiceDesign only supports 1.7B models!")
         
-    # Cache key includes attention implementation and the resolved model folder
-    cache_key = (model_type, model_choice, device, precision, attn_impl, custom_dir)
+    # --- int8 quantization config (bitsandbytes LLM.int8()) ---
+    quant_config = None
+    if quantization == "int8":
+        if device != "cuda":
+            print("[Qwen3-TTS] int8 quantization requires CUDA; falling back to unquantized bf16/fp32 on device '%s'." % device)
+        elif not _BITSANDBYTES_AVAILABLE:
+            print("[Qwen3-TTS] quantization='int8' requested but bitsandbytes/transformers BitsAndBytesConfig is not installed. Falling back to unquantized bf16/fp32.")
+        else:
+            try:
+                quant_config = BitsAndBytesConfig(load_in_8bit=True)
+                print("[Qwen3-TTS] int8 quantization enabled")
+            except Exception as e:
+                print(f"⚠️ [Qwen3-TTS] Failed to build BitsAndBytesConfig: {e}. Falling back to unquantized bf16/fp32.")
+                quant_config = None
+        
+    # Cache key includes attention implementation, the resolved model folder,
+    # and the quantization setting so int8 vs none do not collide
+    cache_key = (model_type, model_choice, device, precision, quantization, attn_impl, custom_dir)
     if cache_key in _MODEL_CACHE:
         return _MODEL_CACHE[cache_key]
 
@@ -853,7 +877,7 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
             from sageattention import sageattn
             print(f"🔧 [Qwen3-TTS] Loading model with sage_attn (sageattention)")
             
-            model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype)
+            model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype, quantization_config=quant_config)
             
             # Patch attention modules to use sageattention
             patched_count = 0
@@ -886,7 +910,7 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
             
         except (ImportError, Exception) as e:
             print(f"⚠️ [Qwen3-TTS] Failed with sage_attn, falling back to default attention: {e}")
-            model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype)
+            model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype, quantization_config=quant_config)
     else:
         # comfy_kitchen branch (int8_attention kernel via Comfy Kitchen package)
         if use_comfy_kitchen:
@@ -895,21 +919,21 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
                 if not comfy_kitchen.int8_attention_is_available():
                     raise ImportError("comfy_kitchen int8_attention not available on this device")
                 print(f"🔧 [Qwen3-TTS] Loading model with comfy_kitchen attention (base sdpa; kitchen backend active)")
-                model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype, attn_implementation="sdpa")
+                model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype, attn_implementation="sdpa", quantization_config=quant_config)
             except (ImportError, Exception) as e:
                 print(f"⚠️ [Qwen3-TTS] comfy_kitchen attention unavailable ({e}), falling back to sdpa")
-                model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype, attn_implementation="sdpa")
+                model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype, attn_implementation="sdpa", quantization_config=quant_config)
         else:
             try:
                 if attn_param:
                     print(f"🔧 [Qwen3-TTS] Loading model with attention: {attn_impl}")
-                    model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype, attn_implementation=attn_param)
+                    model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype, attn_implementation=attn_param, quantization_config=quant_config)
                 else:
                     print(f"🔧 [Qwen3-TTS] Loading model with attention: {attn_impl}")
-                    model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype)
+                    model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype, quantization_config=quant_config)
             except (ImportError, ValueError, Exception) as e:
                 print(f"⚠️ [Qwen3-TTS] Failed with {attn_impl}, falling back to default attention: {e}")
-                model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype)
+                model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype, quantization_config=quant_config)
     
     # Apply patches
     apply_qwen3_patches(model)
@@ -1204,6 +1228,7 @@ class VoiceDesignNode:
                 "model_choice": (["0.6B", "1.7B"], {"default": "1.7B"}),
                 "device": (["auto", "cuda","mps", "cpu"], {"default": "auto"}),
                 "precision": (["bf16", "fp32"], {"default": "bf16"}),
+                "quantization": (["none", "int8"], {"default": "none"}),
                 "language": (DEMO_LANGUAGES, {"default": "Auto"}),
             },
             "optional": {
@@ -1224,7 +1249,7 @@ class VoiceDesignNode:
     CATEGORY = "Qwen3-TTS"
     DESCRIPTION = "VoiceDesign: Generate custom voices from descriptions."
 
-    def generate(self, text: str, instruct: str, model_choice: str, device: str, precision: str, language: str, seed: int = 0, max_new_tokens: int = 2048, top_p: float = 0.8, top_k: int = 20, temperature: float = 1.0, repetition_penalty: float = 1.05, attention: str = "auto", unload_model_after_generate: bool = False) -> Tuple[Dict[str, Any]]:
+    def generate(self, text: str, instruct: str, model_choice: str, device: str, precision: str, language: str, quantization: str = "none", seed: int = 0, max_new_tokens: int = 2048, top_p: float = 0.8, top_k: int = 20, temperature: float = 1.0, repetition_penalty: float = 1.05, attention: str = "auto", unload_model_after_generate: bool = False) -> Tuple[Dict[str, Any]]:
         if not text or not instruct:
             raise RuntimeError("Text and instruction description are required")
 
@@ -1234,12 +1259,12 @@ class VoiceDesignNode:
         previous_attention = None
         for key in _MODEL_CACHE:
             if key[0] == "VoiceDesign":
-                previous_attention = key[4] if len(key) > 4 else None
+                previous_attention = key[5] if len(key) > 5 else None
                 break
 
         pbar.phase_loaded()
 
-        model = load_qwen_model("VoiceDesign", model_choice, device, precision, attention, unload_model_after_generate, previous_attention)
+        model = load_qwen_model("VoiceDesign", model_choice, device, precision, quantization, attention, unload_model_after_generate, previous_attention)
 
         torch.manual_seed(seed)
         if torch.cuda.is_available():
@@ -1293,6 +1318,7 @@ class VoiceCloneNode:
                 "model_choice": (["0.6B", "1.7B"], {"default": "0.6B"}),
                 "device": (["auto", "cuda","mps", "cpu"], {"default": "auto"}),
                 "precision": (["bf16", "fp32"], {"default": "bf16"}),
+                "quantization": (["none", "int8"], {"default": "none"}),
                 "language": (DEMO_LANGUAGES, {"default": "Auto"}),
             },
             "optional": {
@@ -1408,7 +1434,7 @@ class VoiceCloneNode:
         # Return as tuple (waveform, sr) with 1-D numpy waveform as expected by the tokenizer
         return (waveform, int(sr))
 
-    def generate(self, target_text: str, model_choice: str, device: str, precision: str, language: str, 
+    def generate(self, target_text: str, model_choice: str, device: str, precision: str, language: str, quantization: str = "none", 
                  ref_audio: Optional[Dict[str, Any]] = None, ref_text: str = "", 
                  voice_clone_prompt: Optional[Any] = None, seed: int = 0, 
                  max_new_tokens: int = 2048,
@@ -1424,12 +1450,12 @@ class VoiceCloneNode:
         previous_attention = None
         for key in _MODEL_CACHE:
             if key[0] == "Base":
-                previous_attention = key[4] if len(key) > 4 else None
+                previous_attention = key[5] if len(key) > 5 else None
                 break
 
         pbar.phase_loaded()
 
-        model = load_qwen_model("Base", model_choice, device, precision, attention, unload_model_after_generate, previous_attention, custom_model_path)
+        model = load_qwen_model("Base", model_choice, device, precision, quantization, attention, unload_model_after_generate, previous_attention, custom_model_path)
 
         torch.manual_seed(seed)
         if torch.cuda.is_available():
@@ -1506,6 +1532,7 @@ class CustomVoiceNode:
                 "model_choice": (["0.6B", "1.7B"], {"default": "1.7B"}),
                 "device": (["auto", "cuda","mps", "cpu"], {"default": "auto"}),
                 "precision": (["bf16", "fp32"], {"default": "bf16"}),
+                "quantization": (["none", "int8"], {"default": "none"}),
                 "language": (DEMO_LANGUAGES, {"default": "Auto"}),
             },
             "optional": {
@@ -1537,7 +1564,7 @@ class CustomVoiceNode:
     CATEGORY = "Qwen3-TTS"
     DESCRIPTION = "CustomVoice: Generate speech using preset speakers."
 
-    def generate(self, text: str, speaker: str, model_choice: str, device: str, precision: str, language: str, seed: int = 0, instruct: str = "", max_new_tokens: int = 2048, top_p: float = 0.8, top_k: int = 20, temperature: float = 1.0, repetition_penalty: float = 1.05, attention: str = "auto", unload_model_after_generate: bool = False, custom_model_path: str = "", custom_speaker_name: str = "") -> Tuple[Dict[str, Any]]:
+    def generate(self, text: str, speaker: str, model_choice: str, device: str, precision: str, language: str, quantization: str = "none", seed: int = 0, instruct: str = "", max_new_tokens: int = 2048, top_p: float = 0.8, top_k: int = 20, temperature: float = 1.0, repetition_penalty: float = 1.05, attention: str = "auto", unload_model_after_generate: bool = False, custom_model_path: str = "", custom_speaker_name: str = "") -> Tuple[Dict[str, Any]]:
         # Prefer custom_speaker_name if provided
         target_speaker = speaker
         if custom_speaker_name and custom_speaker_name.strip():
@@ -1554,12 +1581,12 @@ class CustomVoiceNode:
         previous_attention = None
         for key in _MODEL_CACHE:
             if key[0] == "CustomVoice":
-                previous_attention = key[4] if len(key) > 4 else None
+                previous_attention = key[5] if len(key) > 5 else None
                 break
 
         pbar.phase_loaded()
 
-        model = load_qwen_model("CustomVoice", model_choice, device, precision, attention, unload_model_after_generate, previous_attention, custom_model_path)
+        model = load_qwen_model("CustomVoice", model_choice, device, precision, quantization, attention, unload_model_after_generate, previous_attention, custom_model_path)
 
         torch.manual_seed(seed)
         if torch.cuda.is_available():
@@ -1615,6 +1642,7 @@ class VoiceClonePromptNode:
                 "model_choice": (["0.6B", "1.7B"], {"default": "0.6B"}),
                 "device": (["auto", "cuda", "mps", "cpu"], {"default": "auto"}),
                 "precision": (["bf16", "fp32"], {"default": "bf16"}),
+                "quantization": (["none", "int8"], {"default": "none"}),
                 "attention": (ATTENTION_OPTIONS, {"default": "auto", "tooltip": "Attention implementation"}),
             },
             "optional": {
@@ -1629,7 +1657,7 @@ class VoiceClonePromptNode:
     CATEGORY = "Qwen3-TTS"
     DESCRIPTION = "VoiceClonePrompt: Extract and cache voice features for reuse in VoiceClone node."
 
-    def create_prompt(self, ref_audio: Dict[str, Any], ref_text: str, model_choice: str, device: str, precision: str, attention: str, x_vector_only: bool = False, unload_model_after_generate: bool = False) -> Tuple[Any]:
+    def create_prompt(self, ref_audio: Dict[str, Any], ref_text: str, model_choice: str, device: str, precision: str, attention: str, quantization: str = "none", x_vector_only: bool = False, unload_model_after_generate: bool = False) -> Tuple[Any]:
         if ref_audio is None:
             raise RuntimeError("Reference audio is required")
 
@@ -1641,12 +1669,12 @@ class VoiceClonePromptNode:
         previous_attention = None
         for key in _MODEL_CACHE:
             if key[0] == "Base":
-                previous_attention = key[4] if len(key) > 4 else None
+                previous_attention = key[5] if len(key) > 5 else None
                 break
 
         pbar.phase_loaded()
 
-        model = load_qwen_model("Base", model_choice, device, precision, attention, unload_model_after_generate, previous_attention)
+        model = load_qwen_model("Base", model_choice, device, precision, quantization, attention, unload_model_after_generate, previous_attention)
 
         pbar.phase_loaded()
 
@@ -1716,6 +1744,7 @@ class DialogueInferenceNode:
                 "model_choice": (["0.6B", "1.7B"], {"default": "1.7B"}),
                 "device": (["auto", "cuda", "mps", "cpu"], {"default": "auto"}),
                 "precision": (["bf16", "fp32"], {"default": "bf16"}),
+                "quantization": (["none", "int8"], {"default": "none"}),
                 "language": (DEMO_LANGUAGES, {"default": "Auto"}),
                 # RENAMED: pause_seconds -> pause_linebreak
                 # Linebreak Pause
@@ -1748,7 +1777,7 @@ class DialogueInferenceNode:
     CATEGORY = "Qwen3-TTS"
     DESCRIPTION = "DialogueInference: Execute a script with multiple roles and generate continuous speech."
     # ### UPDATED ARGUMENTS: Added question_pause, hyphen_pause
-    def generate_dialogue(self, script: str, role_bank: Dict[str, Any], model_choice: str, device: str, precision: str, language: str, pause_linebreak: float, period_pause: float, comma_pause: float, question_pause: float, hyphen_pause: float, merge_outputs: bool, batch_size: int, seed: int = 0, max_new_tokens_per_line: int = 2048, top_p: float = 0.8, top_k: int = 20, temperature: float = 1.0, repetition_penalty: float = 1.05, attention: str = "auto", unload_model_after_generate: bool = False) -> Tuple[Dict[str, Any]]:
+    def generate_dialogue(self, script: str, role_bank: Dict[str, Any], model_choice: str, device: str, precision: str, language: str, pause_linebreak: float, period_pause: float, comma_pause: float, question_pause: float, hyphen_pause: float, merge_outputs: bool, batch_size: int, quantization: str = "none", seed: int = 0, max_new_tokens_per_line: int = 2048, top_p: float = 0.8, top_k: int = 20, temperature: float = 1.0, repetition_penalty: float = 1.05, attention: str = "auto", unload_model_after_generate: bool = False) -> Tuple[Dict[str, Any]]:
         if not script or not role_bank:
             raise RuntimeError("Script and Role Bank are required")
 
@@ -1756,10 +1785,10 @@ class DialogueInferenceNode:
         previous_attention = None
         for key in _MODEL_CACHE:
             if key[0] == "Base":
-                previous_attention = key[4] if len(key) > 4 else None
+                previous_attention = key[5] if len(key) > 5 else None
                 break
 
-        model = load_qwen_model("Base", model_choice, device, precision, attention, unload_model_after_generate, previous_attention)
+        model = load_qwen_model("Base", model_choice, device, precision, quantization, attention, unload_model_after_generate, previous_attention)
 
         torch.manual_seed(seed)
         if torch.cuda.is_available():
