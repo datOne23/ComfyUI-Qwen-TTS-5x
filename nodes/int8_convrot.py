@@ -282,7 +282,6 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
         print(f"⚠️ [Qwen3-TTS] int8-convrot: processor load failed: {e}")
 
     # --- 11. Speech tokenizer (needed for audio decoding in generate) ---
-    from qwen_tts.core.models.modeling_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizer
     st_dir = os.path.join(source, "speech_tokenizer")
     if not os.path.isdir(st_dir):
         raise RuntimeError(
@@ -290,9 +289,15 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
             f"generate_voice_design() requires it to decode audio codes to waveform. "
             f"Ensure the model folder contains speech_tokenizer/."
         )
-    speech_tokenizer = Qwen3TTSTokenizer.from_pretrained(st_dir, local_files_only=True)
-    model.load_speech_tokenizer(speech_tokenizer)
-    print(f"✅ [Qwen3-TTS] int8-convrot: speech tokenizer loaded from {st_dir}")
+    try:
+        from qwen_tts import Qwen3TTSTokenizer
+        speech_tokenizer = Qwen3TTSTokenizer.from_pretrained(st_dir, local_files_only=True)
+        model.load_speech_tokenizer(speech_tokenizer)
+        print(f"✅ [Qwen3-TTS] int8-convrot: speech tokenizer loaded from {st_dir}")
+    except Exception as e:
+        raise RuntimeError(
+            f"[Qwen3-TTS] int8-convrot: failed to load speech tokenizer from {st_dir}: {e}"
+        )
 
     # --- 12. Wrap in Qwen3TTSModel ----------------------------------------------
     wrap = Qwen3TTSModel(model=model, processor=processor,
