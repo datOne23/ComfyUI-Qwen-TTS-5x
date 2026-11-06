@@ -146,6 +146,256 @@ def _load_int8_model(source, int8_source, **kwargs):
     model = _load_model_with_int8(source, **kwargs)
     return model
 
+
+# ---------------------------------------------------------------------------
+# INT8 W8A8 (+ ConvRot) quantization — first-time setup philosophy
+#
+# Quantize once inside ComfyUI on first run, save to models/qwen-tts/, load
+# fast on subsequent runs. Falls back to bf16 when Triton is unavailable.
+# ---------------------------------------------------------------------------
+
+_TRITON_AVAILABLE = False
+try:
+    import triton  # noqa: F401
+    import triton.language as tl  # noqa: F401
+    _TRITON_AVAILABLE = True
+except Exception:
+    triton = None
+    tl = None
+
+_CONVROT_GROUP_SIZE = 256
+_HADAMARD_CACHE = {}
+
+
+def _build_hadamard(size, device="cpu", dtype=torch.float32):
+    """Normalized regular Hadamard matrix (size x size), size a power of two >= 4."""
+    cache_key = (size, str(device), str(dtype))
+    cached = _HADAMARD_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    if size < 4 or (size & (size - 1)) != 0:
+        raise ValueError(f"Hadamard size must be a power of two >= 4, got {size}")
+    h4 = torch.tensor(
+        [[1, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]],
+        dtype=dtype, device=device,
+    )
+    h = h4
+    cur = 4
+    while cur < size:
+        h = torch.kron(h, h4)
+        cur *= 4
+    h = h / (size ** 0.5)
+    _HADAMARD_CACHE[cache_key] = h
+    return h
+
+
+def _rotate_groupwise(x, hadamard, group_size):
+    """Online activation rotation: rotate each group_size block by H."""
+    orig_shape = x.shape
+    features = orig_shape[-1]
+    n_groups = features // group_size
+    grouped = x.reshape(*orig_shape[:-1], n_groups, group_size)
+    h = hadamard.to(dtype=x.dtype, device=x.device)
+    return torch.matmul(grouped, h).reshape(orig_shape)
+
+
+if _TRITON_AVAILABLE:
+    @triton.jit
+    def _w8a8_gemm_kernel(a_ptr, b_ptr, a_scale_ptr, b_scale_ptr, c_ptr,
+                          M, N, K,
+                          stride_am, stride_ak,
+                          stride_bk, stride_bn,
+                          stride_cm, stride_cn,
+                          BLOCK_SIZE_M: tl.constexpr = 64,
+                          BLOCK_SIZE_N: tl.constexpr = 64,
+                          BLOCK_SIZE_K: tl.constexpr = 64):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.int32)
+        for k in range(0, K, BLOCK_SIZE_K):
+            offs_k = k + tl.arange(0, BLOCK_SIZE_K)
+            a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
+            b_mask = (offs_k[:, None] < K) & (offs_n[None, :] < N)
+            a = tl.load(a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak, mask=a_mask, other=0).to(tl.int8)
+            b = tl.load(b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn, mask=b_mask, other=0).to(tl.int8)
+            acc += tl.dot(a, b)
+        a_s = tl.load(a_scale_ptr + offs_m, mask=offs_m < M, other=1.0).to(tl.float32)[:, None]
+        b_s = tl.load(b_scale_ptr + offs_n, mask=offs_n < N, other=1.0).to(tl.float32)[None, :]
+        out = acc.to(tl.float32) * a_s * b_s
+        c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        tl.store(c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, out.to(tl.bfloat16), mask=c_mask)
+
+
+class W8A8Linear(torch.nn.Module):
+    """INT8 weight (+ per-channel fp32 scale) linear layer with optional ConvRot.
+
+    Weight is stored as int8 [out, in] + fp32 scale [out]. Activations are
+    quantized dynamically per token at forward. int8 x int8 -> int32 matmul is
+    done with a Triton kernel and dequantized to bf16. Falls back to bf16 when
+    Triton is unavailable.
+    """
+
+    def __init__(self, in_features, out_features, bias=False, convrot=False, group_size=_CONVROT_GROUP_SIZE):
+        super().__init__()
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        self.group_size = int(group_size)
+        self.convrot = bool(convrot) and (self.in_features % self.group_size == 0)
+        self.weight = torch.nn.Parameter(torch.empty(self.out_features, self.in_features, dtype=torch.int8), requires_grad=False)
+        self.weight_scale = torch.nn.Parameter(torch.empty(self.out_features, dtype=torch.float32), requires_grad=False)
+        if bias:
+            self.bias = torch.nn.Parameter(torch.empty(self.out_features, dtype=torch.bfloat16), requires_grad=False)
+        else:
+            self.register_parameter("bias", None)
+        if self.convrot:
+            self.register_buffer("hadamard", _build_hadamard(self.group_size, device="cpu", dtype=torch.float32), persistent=False)
+        else:
+            self.hadamard = None
+
+    def quantize_from_bf16(self, weight_bf16):
+        w = weight_bf16.to(torch.float32)
+        if self.convrot:
+            w = _rotate_groupwise(w, self.hadamard, self.group_size)
+        w_abs = w.abs()
+        scale = w_abs.max(dim=1, keepdim=True)[0].clamp(min=1e-12) / 127.0
+        w_q = (w / scale).round().clamp(-128, 127).to(torch.int8)
+        self.weight.data = w_q
+        self.weight_scale.data = scale.squeeze(1).to(torch.float32)
+
+    def forward(self, x):
+        x_in = x
+        if self.convrot:
+            x_in = _rotate_groupwise(x_in, self.hadamard, self.group_size)
+        x_f = x_in.to(torch.float32)
+        x_scale = x_f.abs().max(dim=-1, keepdim=True)[0].clamp(min=1e-12) / 127.0
+        x_q = (x_f / x_scale).round().clamp(-128, 127).to(torch.int8)
+        out = self._matmul_dequant(x_q, x_scale)
+        if getattr(self, "bias", None) is not None:
+            out = out + self.bias.to(out.dtype)
+        return out
+
+    def _matmul_dequant(self, x_q, x_scale):
+        flat = x_q.reshape(-1, self.in_features)
+        flat_scale = x_scale.reshape(-1, 1)
+        M, K = flat.shape
+        N = self.out_features
+        out = torch.empty(M, N, dtype=torch.bfloat16, device=flat.device)
+        if _TRITON_AVAILABLE and flat.is_cuda and self.weight.is_cuda:
+            try:
+                _w8a8_gemm_kernel[(M + 63) // 64, (N + 63) // 64](
+                    flat, self.weight, flat_scale.reshape(-1), self.weight_scale, out,
+                    M, N, K,
+                    flat.stride(0), flat.stride(1),
+                    self.weight.stride(0), self.weight.stride(1),
+                    out.stride(0), out.stride(1),
+                )
+                return out.reshape(*x_q.shape[:-1], N)
+            except Exception:
+                pass
+        # bf16 fallback: dequantize weight then bf16 matmul
+        w_bf16 = (self.weight.to(torch.float32) * self.weight_scale.to(torch.float32)[:, None]).to(torch.bfloat16)
+        a_bf16 = (flat.to(torch.float32) * flat_scale.to(torch.float32)).to(torch.bfloat16)
+        out = torch.nn.functional.linear(a_bf16, w_bf16, None)
+        return out.reshape(*x_q.shape[:-1], N)
+
+
+def _convert_linear_to_w8a8(model, skip_modules, convrot=True, group_size=_CONVROT_GROUP_SIZE):
+    """Convert eligible Linear modules to W8A8Linear (quantize bf16 weight -> int8 + scale).
+
+    ConvRot is applied only when in_features % group_size == 0.
+    """
+    converted = 0
+    skipped = 0
+    for name, module in list(model.named_modules()):
+        if not isinstance(module, torch.nn.Linear):
+            continue
+        if any(skip in name for skip in skip_modules):
+            skipped += 1
+            continue
+        use_convrot = bool(convrot) and (module.in_features % group_size == 0)
+        parent, child = _get_parent_module(model, name)
+        new_module = W8A8Linear(module.in_features, module.out_features,
+                                bias=(module.bias is not None),
+                                convrot=use_convrot, group_size=group_size)
+        new_module.quantize_from_bf16(module.weight.detach())
+        if module.bias is not None:
+            new_module.bias.data = module.bias.detach().to(torch.bfloat16)
+        if isinstance(parent, torch.nn.ModuleList):
+            parent[int(child)] = new_module
+        else:
+            setattr(parent, child, new_module)
+        converted += 1
+    print(f"[Qwen3-TTS] w8a8: converted {converted} Linear layers (skipped {skipped} sensitive modules).")
+    return converted
+
+
+def _quantize_model_w8a8(source, model_name, qwen_root, device_map="cuda", dtype=torch.bfloat16,
+                         attn_implementation=None, quantization_config=None, convrot=True):
+    """First-run: load bf16 model, convert talker Linear layers to W8A8Linear,
+    save *_w8a8.safetensors + _comfy_quant.json sidecar. Returns the model."""
+    from safetensors.torch import save_file
+    import json
+
+    load_kwargs = {"device_map": device_map, "dtype": dtype, "quantization_config": None}
+    if attn_implementation:
+        load_kwargs["attn_implementation"] = attn_implementation
+    print(f"🔧 [Qwen3-TTS] w8a8: loading bf16 model for one-time quantization: {source}")
+    model = _load_model_with_int8(source, **load_kwargs)
+    _convert_linear_to_w8a8(model.model, _INT8_SKIP_MODULES, convrot=convrot, group_size=_CONVROT_GROUP_SIZE)
+    if device_map != "cpu" and torch.cuda.is_available():
+        model.model = model.model.cuda()
+    os.makedirs(qwen_root, exist_ok=True)
+    w8a8_path = os.path.join(qwen_root, model_name + "_w8a8.safetensors")
+    sidecar_path = os.path.join(qwen_root, model_name + "_w8a8_comfy_quant.json")
+    print(f"💾 [Qwen3-TTS] w8a8: saving quantized checkpoint to {w8a8_path}")
+    sd = model.model.state_dict()
+    cpu_sd = {k: (v.cpu() if hasattr(v, "cpu") else v) for k, v in sd.items()}
+    save_file(cpu_sd, w8a8_path)
+    metadata = {
+        "format": "int8_w8a8",
+        "convrot": bool(convrot),
+        "convrot_groupsize": _CONVROT_GROUP_SIZE,
+        "dtype": str(dtype),
+    }
+    with open(sidecar_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2, ensure_ascii=False)
+    print(f"💾 [Qwen3-TTS] w8a8: saved sidecar to {sidecar_path}")
+    return model
+
+
+def _load_w8a8_model(source, w8a8_path, device_map="cuda", dtype=torch.bfloat16,
+                     attn_implementation=None, quantization_config=None):
+    """Subsequent-run fast path: load bf16 model, convert Linear -> W8A8Linear,
+    move to CUDA, load state_dict from *_w8a8.safetensors. Returns model."""
+    from safetensors.torch import load_file
+    import json
+
+    load_kwargs = {"device_map": device_map, "dtype": dtype, "quantization_config": None}
+    if attn_implementation:
+        load_kwargs["attn_implementation"] = attn_implementation
+    model = _load_model_with_int8(source, **load_kwargs)
+    sidecar_path = w8a8_path[:-len(".safetensors")] + "_comfy_quant.json"
+    convrot = True
+    group_size = _CONVROT_GROUP_SIZE
+    if os.path.exists(sidecar_path):
+        try:
+            with open(sidecar_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            convrot = bool(meta.get("convrot", True))
+            group_size = int(meta.get("convrot_groupsize", _CONVROT_GROUP_SIZE))
+        except Exception:
+            pass
+    _convert_linear_to_w8a8(model.model, _INT8_SKIP_MODULES, convrot=convrot, group_size=group_size)
+    if device_map != "cpu" and torch.cuda.is_available():
+        model.model = model.model.cuda()
+    print(f"🚀 [Qwen3-TTS] w8a8: loading fast-path quantized weights from {w8a8_path}")
+    state_dict = load_file(w8a8_path, device="cpu")
+    model.model.load_state_dict(state_dict, strict=False)
+    return model
+
+
 # Register "qwen-tts" model folder for extra_model_paths.yaml support
 try:
     folder_paths.add_model_folder_path("qwen-tts", os.path.join(folder_paths.models_dir, "qwen-tts"))
@@ -890,7 +1140,10 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
         else:
             device = "cpu"
     
-    if quantization == "int8":
+    if quantization == "w8a8":
+        # W8A8 activations dequantize to bf16; keep everything in bf16 on CUDA.
+        dtype = torch.bfloat16
+    elif quantization == "int8":
         # bitsandbytes int8 matmul kernels compute in float16; matching dtype
         # avoids the bf16->fp16 cast warning at its source
         dtype = torch.float16
@@ -1030,70 +1283,94 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
         attn_param = "sdpa"
     elif attn_impl == "eager":
         attn_param = "eager"
-    
-    # Handle sage_attn (sageattention package)
-    if use_sage_attn:
-        try:
-            from sageattention import sageattn
-            print(f"🔧 [Qwen3-TTS] Loading model with sage_attn (sageattention)")
-            
-            model = _load_int8_model(final_source, int8_source, device_map=device, dtype=dtype, quantization_config=quant_config)
-            
-            # Patch attention modules to use sageattention
-            patched_count = 0
-            for name, module in model.model.named_modules():
-                if hasattr(module, 'forward') and 'Attention' in type(module).__name__ or 'attn' in name.lower():
-                    try:
-                        original_forward = module.forward
-                        def make_sage_forward(orig_forward, mod):
-                            def sage_forward(*args, **kwargs):
-                                # Extract q, k, v from attention call
-                                if len(args) >= 3:
-                                    q, k, v = args[0], args[1], args[2]
-                                else:
-                                    return orig_forward(*args, **kwargs)
-                                
-                                # Handle attention_mask
-                                attn_mask = kwargs.get('attention_mask', None)
-                                
-                                # Call sageattention
-                                out = sageattn(q, k, v, is_causal=False, attn_mask=attn_mask)
-                                return out
-                            return sage_forward
-                        
-                        module.forward = make_sage_forward(original_forward, module)
-                        patched_count += 1
-                    except Exception:
-                        pass
-            
-            print(f"🔧 [Qwen3-TTS] Patched {patched_count} attention modules with sage_attn")
-            
-        except (ImportError, Exception) as e:
-            print(f"⚠️ [Qwen3-TTS] Failed with sage_attn, falling back to default attention: {e}")
-            model = _load_int8_model(final_source, int8_source, device_map=device, dtype=dtype, quantization_config=quant_config)
-    else:
-        # comfy_kitchen branch (int8_attention kernel via Comfy Kitchen package)
-        if use_comfy_kitchen:
-            try:
-                import comfy_kitchen  # noqa: F401
-                if not comfy_kitchen.int8_attention_is_available():
-                    raise ImportError("comfy_kitchen int8_attention not available on this device")
-                print(f"🔧 [Qwen3-TTS] Loading model with comfy_kitchen attention (base sdpa; kitchen backend active)")
-                model = _load_int8_model(final_source, int8_source, device_map=device, dtype=dtype, attn_implementation="sdpa", quantization_config=quant_config)
-            except (ImportError, Exception) as e:
-                print(f"⚠️ [Qwen3-TTS] comfy_kitchen attention unavailable ({e}), falling back to sdpa")
-                model = _load_int8_model(final_source, int8_source, device_map=device, dtype=dtype, attn_implementation="sdpa", quantization_config=quant_config)
+
+    # --- w8a8 quantization (quantize once, load fast) ---
+    w8a8_loaded = False
+    if quantization == "w8a8":
+        if device != "cuda" or not torch.cuda.is_available():
+            print("[Qwen3-TTS] w8a8 quantization requires CUDA; falling back to unquantized bf16/fp32.")
+            quantization = "none"
         else:
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            comfy_models_path = os.path.join(os.path.dirname(os.path.dirname(current_dir)), "models")
+            qwen_root = os.path.join(comfy_models_path, "qwen-tts")
+            model_name = os.path.basename(final_source)
+            w8a8_path = os.path.join(qwen_root, model_name + "_w8a8.safetensors")
+            if os.path.exists(w8a8_path):
+                print(f"🔧 [Qwen3-TTS] w8a8: loading pre-quantized weights from disk: {w8a8_path}")
+                model = _load_w8a8_model(final_source, w8a8_path, device_map=device, dtype=dtype,
+                                         attn_implementation=attn_param, quantization_config=None)
+                w8a8_loaded = True
+            else:
+                print(f"🔧 [Qwen3-TTS] w8a8: no saved weights found at {w8a8_path}; running first-time "
+                      f"quantization (one-time, may take a few minutes)...")
+                model = _quantize_model_w8a8(final_source, model_name, qwen_root, device_map=device, dtype=dtype,
+                                             attn_implementation=attn_param, quantization_config=None, convrot=True)
+                w8a8_loaded = True
+
+    if not w8a8_loaded:
+        if use_sage_attn:
             try:
-                if attn_param:
-                    print(f"🔧 [Qwen3-TTS] Loading model with attention: {attn_impl}")
-                    model = _load_int8_model(final_source, int8_source, device_map=device, dtype=dtype, attn_implementation=attn_param, quantization_config=quant_config)
-                else:
-                    print(f"🔧 [Qwen3-TTS] Loading model with attention: {attn_impl}")
-                    model = _load_int8_model(final_source, int8_source, device_map=device, dtype=dtype, quantization_config=quant_config)
-            except (ImportError, ValueError, Exception) as e:
-                print(f"⚠️ [Qwen3-TTS] Failed with {attn_impl}, falling back to default attention: {e}")
+                from sageattention import sageattn
+                print(f"🔧 [Qwen3-TTS] Loading model with sage_attn (sageattention)")
+                
                 model = _load_int8_model(final_source, int8_source, device_map=device, dtype=dtype, quantization_config=quant_config)
+                
+                # Patch attention modules to use sageattention
+                patched_count = 0
+                for name, module in model.model.named_modules():
+                    if hasattr(module, 'forward') and 'Attention' in type(module).__name__ or 'attn' in name.lower():
+                        try:
+                            original_forward = module.forward
+                            def make_sage_forward(orig_forward, mod):
+                                def sage_forward(*args, **kwargs):
+                                    # Extract q, k, v from attention call
+                                    if len(args) >= 3:
+                                        q, k, v = args[0], args[1], args[2]
+                                    else:
+                                        return orig_forward(*args, **kwargs)
+                                    
+                                    # Handle attention_mask
+                                    attn_mask = kwargs.get('attention_mask', None)
+                                    
+                                    # Call sageattention
+                                    out = sageattn(q, k, v, is_causal=False, attn_mask=attn_mask)
+                                    return out
+                                return sage_forward
+                            
+                            module.forward = make_sage_forward(original_forward, module)
+                            patched_count += 1
+                        except Exception:
+                            pass
+                
+                print(f"🔧 [Qwen3-TTS] Patched {patched_count} attention modules with sage_attn")
+                
+            except (ImportError, Exception) as e:
+                print(f"⚠️ [Qwen3-TTS] Failed with sage_attn, falling back to default attention: {e}")
+                model = _load_int8_model(final_source, int8_source, device_map=device, dtype=dtype, quantization_config=quant_config)
+        else:
+            # comfy_kitchen branch (int8_attention kernel via Comfy Kitchen package)
+            if use_comfy_kitchen:
+                try:
+                    import comfy_kitchen  # noqa: F401
+                    if not comfy_kitchen.int8_attention_is_available():
+                        raise ImportError("comfy_kitchen int8_attention not available on this device")
+                    print(f"🔧 [Qwen3-TTS] Loading model with comfy_kitchen attention (base sdpa; kitchen backend active)")
+                    model = _load_int8_model(final_source, int8_source, device_map=device, dtype=dtype, attn_implementation="sdpa", quantization_config=quant_config)
+                except (ImportError, Exception) as e:
+                    print(f"⚠️ [Qwen3-TTS] comfy_kitchen attention unavailable ({e}), falling back to sdpa")
+                    model = _load_int8_model(final_source, int8_source, device_map=device, dtype=dtype, attn_implementation="sdpa", quantization_config=quant_config)
+            else:
+                try:
+                    if attn_param:
+                        print(f"🔧 [Qwen3-TTS] Loading model with attention: {attn_impl}")
+                        model = _load_int8_model(final_source, int8_source, device_map=device, dtype=dtype, attn_implementation=attn_param, quantization_config=quant_config)
+                    else:
+                        print(f"🔧 [Qwen3-TTS] Loading model with attention: {attn_impl}")
+                        model = _load_int8_model(final_source, int8_source, device_map=device, dtype=dtype, quantization_config=quant_config)
+                except (ImportError, ValueError, Exception) as e:
+                    print(f"⚠️ [Qwen3-TTS] Failed with {attn_impl}, falling back to default attention: {e}")
+                    model = _load_int8_model(final_source, int8_source, device_map=device, dtype=dtype, quantization_config=quant_config)
     
     # Apply patches
     apply_qwen3_patches(model)
@@ -1418,7 +1695,7 @@ class VoiceDesignNode:
                 "model_choice": (["0.6B", "1.7B"], {"default": "1.7B"}),
                 "device": (["auto", "cuda","mps", "cpu"], {"default": "auto"}),
                 "precision": (["bf16", "fp32"], {"default": "bf16"}),
-                "quantization": (["none", "int8"], {"default": "none"}),
+                "quantization": (["none", "w8a8", "int8"], {"default": "none"}),
                 "language": (DEMO_LANGUAGES, {"default": "Auto"}),
             },
             "optional": {
@@ -1508,7 +1785,7 @@ class VoiceCloneNode:
                 "model_choice": (["0.6B", "1.7B"], {"default": "0.6B"}),
                 "device": (["auto", "cuda","mps", "cpu"], {"default": "auto"}),
                 "precision": (["bf16", "fp32"], {"default": "bf16"}),
-                "quantization": (["none", "int8"], {"default": "none"}),
+                "quantization": (["none", "w8a8", "int8"], {"default": "none"}),
                 "language": (DEMO_LANGUAGES, {"default": "Auto"}),
             },
             "optional": {
@@ -1722,7 +1999,7 @@ class CustomVoiceNode:
                 "model_choice": (["0.6B", "1.7B"], {"default": "1.7B"}),
                 "device": (["auto", "cuda","mps", "cpu"], {"default": "auto"}),
                 "precision": (["bf16", "fp32"], {"default": "bf16"}),
-                "quantization": (["none", "int8"], {"default": "none"}),
+                "quantization": (["none", "w8a8", "int8"], {"default": "none"}),
                 "language": (DEMO_LANGUAGES, {"default": "Auto"}),
             },
             "optional": {
@@ -1832,7 +2109,7 @@ class VoiceClonePromptNode:
                 "model_choice": (["0.6B", "1.7B"], {"default": "0.6B"}),
                 "device": (["auto", "cuda", "mps", "cpu"], {"default": "auto"}),
                 "precision": (["bf16", "fp32"], {"default": "bf16"}),
-                "quantization": (["none", "int8"], {"default": "none"}),
+                "quantization": (["none", "w8a8", "int8"], {"default": "none"}),
                 "attention": (ATTENTION_OPTIONS, {"default": "auto", "tooltip": "Attention implementation"}),
             },
             "optional": {
@@ -1934,7 +2211,7 @@ class DialogueInferenceNode:
                 "model_choice": (["0.6B", "1.7B"], {"default": "1.7B"}),
                 "device": (["auto", "cuda", "mps", "cpu"], {"default": "auto"}),
                 "precision": (["bf16", "fp32"], {"default": "bf16"}),
-                "quantization": (["none", "int8"], {"default": "none"}),
+                "quantization": (["none", "w8a8", "int8"], {"default": "none"}),
                 "language": (DEMO_LANGUAGES, {"default": "Auto"}),
                 # RENAMED: pause_seconds -> pause_linebreak
                 # Linebreak Pause

@@ -15,6 +15,12 @@ onnxruntime-gpu
 safetensors
 scipy>=1.11.0
 
+# Optional: triton for INT8 W8A8 (+ConvRot) quantization (long-term replacement for bitsandbytes).
+# Enables fast int8xint8 matmul via Triton kernel. Install manually:
+#   pip install triton
+#   (or: pip install triton --index-url https://pypi.org/simple/)
+# triton
+
 # Optional: bitsandbytes for int8 (LLM.int8()) quantization.
-# Not auto-installed on Windows — install the matching CUDA wheel manually.
+# Kept as fallback for users without Triton. Install matching CUDA wheel manually.
 # bitsandbytes
