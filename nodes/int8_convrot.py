@@ -276,16 +276,16 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
     except Exception as e:
         print(f"⚠️ [Qwen3-TTS] int8-convrot: processor load failed: {e}")
 
-    # --- 11. Speech tokenizer (Base model only) --------------------------------
-    if load_speech_tokenizer:
-        try:
-            from qwen_tts.core.models.modeling_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizer
-            st_dir = os.path.join(source, "speech_tokenizer")
-            if os.path.isdir(st_dir):
-                speech_tokenizer = Qwen3TTSTokenizer.from_pretrained(st_dir, local_files_only=True)
-                model.load_speech_tokenizer(speech_tokenizer)
-        except Exception as e:
-            print(f"⚠️ [Qwen3-TTS] int8-convrot: speech tokenizer load skipped ({e})")
+    # --- 11. Speech tokenizer (needed for audio decoding in generate) ---
+    try:
+        from qwen_tts.core.models.modeling_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizer
+        st_dir = os.path.join(source, "speech_tokenizer")
+        if os.path.isdir(st_dir):
+            speech_tokenizer = Qwen3TTSTokenizer.from_pretrained(st_dir, local_files_only=True)
+            model.load_speech_tokenizer(speech_tokenizer)
+            print(f"✅ [Qwen3-TTS] int8-convrot: speech tokenizer loaded from {st_dir}")
+    except Exception as e:
+        print(f"⚠️ [Qwen3-TTS] int8-convrot: speech tokenizer load skipped ({e})")
 
     # --- 11. Wrap in Qwen3TTSModel ----------------------------------------------
     wrap = Qwen3TTSModel(model=model, processor=processor,
