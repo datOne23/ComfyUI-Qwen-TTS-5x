@@ -32,6 +32,25 @@ INT8_CONVROT_EXCLUDE = ("codec_encoder|codec_decoder|speaker_encoder|vocoder|"
                         "seanet|audio_codec|feature_projection|output_proj|lm_head")
 
 
+def _resolve_model_source(source):
+    """Resolve a model directory to the actual weight file for the converter.
+
+    The converter opens SRC as a single file (.safetensors via safe_open, or
+    .pth/.pt/.ckpt via torch.load). A HuggingFace snapshot directory is not a
+    file, so we look for model.safetensors (or any .safetensors) inside it.
+    """
+    if os.path.isfile(source):
+        return source
+    if os.path.isdir(source):
+        candidate = os.path.join(source, "model.safetensors")
+        if os.path.isfile(candidate):
+            return candidate
+        for f in os.listdir(source):
+            if f.lower().endswith(".safetensors"):
+                return os.path.join(source, f)
+    return source
+
+
 def _decode_comfy_quant(raw):
     """Decode a uint8 comfy_quant tensor to a dict."""
     text = bytes(raw.tolist()).decode("utf-8")
@@ -107,9 +126,11 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
         print(f"🔧 [Qwen3-TTS] int8-convrot: no saved weights found at {int8_convrot_path}; "
               f"running one-time conversion...")
 
+        conv_source = _resolve_model_source(source)
+
         # Validate with --dry-run first
         dry_run_cmd = [
-            sys.executable, CONVERTER_SCRIPT, source, int8_convrot_path,
+            sys.executable, CONVERTER_SCRIPT, conv_source, int8_convrot_path,
             "--dry-run",
             "--exclude", INT8_CONVROT_EXCLUDE,
             "--min-gemm", "256",
@@ -134,7 +155,7 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
 
         # Full conversion
         convert_cmd = [
-            sys.executable, CONVERTER_SCRIPT, source, int8_convrot_path,
+            sys.executable, CONVERTER_SCRIPT, conv_source, int8_convrot_path,
             "--exclude", INT8_CONVROT_EXCLUDE,
             "--min-gemm", "256",
             "--mseclip",
