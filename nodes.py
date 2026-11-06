@@ -1119,12 +1119,13 @@ def unload_cached_model(cache_key=None):
         models_to_unload = list(_MODEL_CACHE.values())
         _MODEL_CACHE.clear()
 
-    # Move models to CPU and null out all references so CUDA tensors are freed
+    # Move inner models to CPU and null out ALL references so CUDA tensors are freed
     for model in models_to_unload:
         try:
             if hasattr(model, "model") and model.model is not None:
-                if hasattr(model.model, "cpu"):
-                    model.model = model.model.cpu()
+                inner = model.model
+                if hasattr(inner, "cpu"):
+                    inner.cpu()  # in-place: frees CUDA tensors
                 model.model = None
         except Exception:
             pass
@@ -1137,14 +1138,32 @@ def unload_cached_model(cache_key=None):
             model._unload_callback = None
         except Exception:
             pass
+        try:
+            if hasattr(model, "generate_defaults"):
+                model.generate_defaults = {}
+        except Exception:
+            pass
 
     del models_to_unload
+
+    # Clear Triton kernel cache (compiled kernels hold GPU memory)
+    try:
+        import triton.runtime
+        if hasattr(triton.runtime, "cache") and hasattr(triton.runtime.cache, "clear"):
+            triton.runtime.cache.clear()
+    except Exception:
+        pass
 
     model_management.soft_empty_cache()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
 
     import gc
+    gc.collect()
     gc.collect()
     gc.collect()
 
