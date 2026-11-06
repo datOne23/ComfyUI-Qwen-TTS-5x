@@ -27,7 +27,7 @@ from ._boot import (
 )
 from .progress import TTSProgress
 
-CONVERTER_SCRIPT = os.path.join(COMFY_ROOT, "comfy-model-tools", "quant_int8_convrot.py")
+CONVERTER_SCRIPT = os.path.join(COMFY_ROOT, "custom_nodes", "comfy-model-tools", "quant_int8_convrot.py")
 INT8_CONVROT_EXCLUDE = ("codec_encoder|codec_decoder|speaker_encoder|vocoder|"
                         "seanet|audio_codec|feature_projection|output_proj|lm_head")
 
@@ -205,9 +205,10 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
 
     # --- 3. Register custom classes for config resolution ---------------------
     from transformers import AutoConfig, AutoModel, AutoProcessor
-    AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
-    AutoModel.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
-    AutoProcessor.register(Qwen3TTSConfig, type("Qwen3TTSProcessor", (), {}))
+    from qwen_tts.core.models.processing_qwen3_tts import Qwen3TTSProcessor
+    AutoConfig.register("qwen3_tts", Qwen3TTSConfig, exist_ok=True)
+    AutoModel.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration, exist_ok=True)
+    AutoProcessor.register(Qwen3TTSConfig, Qwen3TTSProcessor, exist_ok=True)
 
     # --- 4. Read config ---------------------------------------------------------
     print(f"🔧 [Qwen3-TTS] int8-convrot: loading config from {source}")
@@ -255,40 +256,46 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
     print(f"🔧 [Qwen3-TTS] int8-convrot: missing={len(missing) if missing is not None else 'n/a'}, "
           f"unexpected={len(unexpected) if unexpected is not None else 'n/a'}")
 
-    # --- 8. Move to device (dtype unchanged — int8 weights already dequantized) --
-    model = model.to(device)
+    # --- 8. Move to device with compute dtype ------------------------------------
+    model = model.to(device=device, dtype=dtype)
     model.eval()
 
     # --- 9. Generation config ----------------------------------------------------
     gen_cfg_path = os.path.join(source, "generation_config.json")
     if os.path.exists(gen_cfg_path):
         with open(gen_cfg_path, "r", encoding="utf-8") as f:
-            model.load_generate_config(json.load(f))
+            gen_cfg = json.load(f)
+        if hasattr(model, "load_generate_config"):
+            model.load_generate_config(gen_cfg)
+        else:
+            model.generate_config = gen_cfg
 
     # --- 10. Text processor (needed for text tokenization in generate) ---
     processor = None
     try:
         from transformers import AutoTokenizer
         from qwen_tts.core.models.processing_qwen3_tts import Qwen3TTSProcessor
-        tokenizer = AutoTokenizer.from_pretrained(source, local_files_only=True)
+        tokenizer = AutoTokenizer.from_pretrained(source, local_files_only=True, fix_mistral_regex=True)
         processor = Qwen3TTSProcessor(tokenizer=tokenizer)
         print(f"✅ [Qwen3-TTS] int8-convrot: processor loaded from {source}")
     except Exception as e:
         print(f"⚠️ [Qwen3-TTS] int8-convrot: processor load failed: {e}")
 
     # --- 11. Speech tokenizer (needed for audio decoding in generate) ---
-    try:
-        from qwen_tts.core.models.modeling_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizer
-        st_dir = os.path.join(source, "speech_tokenizer")
-        if os.path.isdir(st_dir):
-            speech_tokenizer = Qwen3TTSTokenizer.from_pretrained(st_dir, local_files_only=True)
-            model.load_speech_tokenizer(speech_tokenizer)
-            print(f"✅ [Qwen3-TTS] int8-convrot: speech tokenizer loaded from {st_dir}")
-    except Exception as e:
-        print(f"⚠️ [Qwen3-TTS] int8-convrot: speech tokenizer load skipped ({e})")
+    from qwen_tts.core.models.modeling_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizer
+    st_dir = os.path.join(source, "speech_tokenizer")
+    if not os.path.isdir(st_dir):
+        raise RuntimeError(
+            f"[Qwen3-TTS] int8-convrot: speech_tokenizer directory not found at {st_dir}. "
+            f"generate_voice_design() requires it to decode audio codes to waveform. "
+            f"Ensure the model folder contains speech_tokenizer/."
+        )
+    speech_tokenizer = Qwen3TTSTokenizer.from_pretrained(st_dir, local_files_only=True)
+    model.load_speech_tokenizer(speech_tokenizer)
+    print(f"✅ [Qwen3-TTS] int8-convrot: speech tokenizer loaded from {st_dir}")
 
-    # --- 11. Wrap in Qwen3TTSModel ----------------------------------------------
+    # --- 12. Wrap in Qwen3TTSModel ----------------------------------------------
     wrap = Qwen3TTSModel(model=model, processor=processor,
-                         generate_defaults=getattr(model, "generate_config", {}))
+                         generate_defaults=getattr(model, "generate_config", None) or {})
     print(f"🚀 [Qwen3-TTS] int8-convrot: model ready on {device}")
     return wrap
