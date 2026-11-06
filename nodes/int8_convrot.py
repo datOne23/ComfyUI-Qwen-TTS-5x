@@ -74,7 +74,8 @@ def _dequantize_convrot(qd, scale, gs, device):
     Approach A: comfy_kitchen TensorWiseINT8Layout.dequantize (preferred).
     Approach B: manual _build_hadamard + _rotate_weight inverse (fallback).
     """
-    qd = qd.to(torch.int8, device=device, non_blocking=True)
+    # NOTE: must use kwargs form — to(dtype, device=...) is not a valid overload.
+    qd = qd.to(device=device, dtype=torch.int8, non_blocking=True)
     scale = scale.to(device=device, non_blocking=True)
 
     if _COMFY_KITCHEN_AVAILABLE and TensorWiseINT8Layout is not None:
@@ -88,7 +89,7 @@ def _dequantize_convrot(qd, scale, gs, device):
                 convrot_groupsize=gs,
             )
             deq = TensorWiseINT8Layout.dequantize(qd, params)
-            return deq.to(torch.bfloat16, device=device, non_blocking=True)
+            return deq.to(device=device, dtype=torch.bfloat16, non_blocking=True)
         except Exception as e:
             global _FALLBACK_LOGGED
             if not _FALLBACK_LOGGED:
