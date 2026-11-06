@@ -26,6 +26,21 @@ except Exception:
     pass
 
 
+def _comfy_attention_available() -> dict:
+    """Mirror ComfyUI's native attention-backend detection for the Qwen-TTS node layer."""
+    try:
+        import comfy.model_management as _mm
+    except Exception:
+        return {}
+    return {
+        "xformers": bool(getattr(_mm, "xformers_enabled", lambda: False)()),
+        "flash_attn": bool(getattr(_mm, "flash_attention_enabled", lambda: False)()),
+        "sage_attn": bool(getattr(_mm, "sage_attention_enabled", lambda: False)()),
+        "comfy_kitchen": bool(getattr(_mm, "comfy_kitchen_attention_enabled", lambda: False)()),
+        "sdpa": True,
+        "eager": True,
+    }
+
 
 # Common languages list for UI
 DEMO_LANGUAGES = [
@@ -362,27 +377,49 @@ def _register_safe_globals():
     _SAFE_GLOBALS_REGISTERED = True
 
 
-ATTENTION_OPTIONS = ["auto", "sage_attn", "flash_attn", "sdpa", "eager"]
+ATTENTION_OPTIONS = ["auto", "sage_attn", "flash_attn", "sdpa", "eager", "xformers", "comfy_kitchen"]
 
 def check_attention_implementation():
     """Check available attention implementations and return in priority order."""
     available = []
 
+    # Prefer ComfyUI's own backend detection (honours --use-ck-attention / --use-sage-attention / etc.)
     try:
-        from sageattention import sageattn
-        available.append("sage_attn")
-    except ImportError:
+        comfy_avail = _comfy_attention_available()
+        priority_map = {
+            "sage_attn": "sage_attn",
+            "flash_attn": "flash_attn",
+            "xformers": "xformers",
+            "comfy_kitchen": "comfy_kitchen",
+        }
+        for name, flag in priority_map.items():
+            if comfy_avail.get(name):
+                available.append(name)
+    except Exception:
         pass
 
+    # Fallback: direct package probes (unchanged behavior)
     try:
-        import flash_attn
-        available.append("flash_attn")
+        from sageattention import sageattn  # noqa: F401
+        if "sage_attn" not in available:
+            available.append("sage_attn")
+    except ImportError:
+        pass
+    try:
+        import flash_attn  # noqa: F401
+        if "flash_attn" not in available:
+            available.append("flash_attn")
+    except ImportError:
+        pass
+    try:
+        import comfy_kitchen  # noqa: F401
+        if comfy_kitchen.int8_attention_is_available() and "comfy_kitchen" not in available:
+            available.append("comfy_kitchen")
     except ImportError:
         pass
 
     available.append("sdpa")
     available.append("eager")
-
     return available
 
 def get_attention_implementation(selection: str) -> str:
@@ -390,7 +427,7 @@ def get_attention_implementation(selection: str) -> str:
     available = check_attention_implementation()
 
     if selection == "auto":
-        priority = ["sage_attn", "flash_attn", "sdpa", "eager"]
+        priority = ["sage_attn", "comfy_kitchen", "flash_attn", "xformers", "sdpa", "eager"]
         for attn in priority:
             if attn in available:
                 print(f"[Qwen3-TTS] Auto-selected attention: {attn}")
@@ -794,9 +831,15 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
     # Map attention implementation to model loading parameter
     attn_param = None
     use_sage_attn = False
-    
+    use_comfy_kitchen = False
+
     if attn_impl == "flash_attn":
         attn_param = "flash_attention_2"
+    elif attn_impl == "xformers":
+        attn_param = "sdpa"   # transformers has no 'xformers' value; fall back to sdpa
+    elif attn_impl == "comfy_kitchen":
+        use_comfy_kitchen = True
+        attn_param = "sdpa"   # base path; comfy_kitchen applied via backend hook below
     elif attn_impl == "sage_attn":
         use_sage_attn = True
     elif attn_impl == "sdpa":
@@ -845,16 +888,28 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
             print(f"⚠️ [Qwen3-TTS] Failed with sage_attn, falling back to default attention: {e}")
             model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype)
     else:
-        try:
-            if attn_param:
-                print(f"🔧 [Qwen3-TTS] Loading model with attention: {attn_impl}")
-                model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype, attn_implementation=attn_param)
-            else:
-                print(f"🔧 [Qwen3-TTS] Loading model with attention: {attn_impl}")
+        # comfy_kitchen branch (int8_attention kernel via Comfy Kitchen package)
+        if use_comfy_kitchen:
+            try:
+                import comfy_kitchen  # noqa: F401
+                if not comfy_kitchen.int8_attention_is_available():
+                    raise ImportError("comfy_kitchen int8_attention not available on this device")
+                print(f"🔧 [Qwen3-TTS] Loading model with comfy_kitchen attention (base sdpa; kitchen backend active)")
+                model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype, attn_implementation="sdpa")
+            except (ImportError, Exception) as e:
+                print(f"⚠️ [Qwen3-TTS] comfy_kitchen attention unavailable ({e}), falling back to sdpa")
+                model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype, attn_implementation="sdpa")
+        else:
+            try:
+                if attn_param:
+                    print(f"🔧 [Qwen3-TTS] Loading model with attention: {attn_impl}")
+                    model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype, attn_implementation=attn_param)
+                else:
+                    print(f"🔧 [Qwen3-TTS] Loading model with attention: {attn_impl}")
+                    model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype)
+            except (ImportError, ValueError, Exception) as e:
+                print(f"⚠️ [Qwen3-TTS] Failed with {attn_impl}, falling back to default attention: {e}")
                 model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype)
-        except (ImportError, ValueError, Exception) as e:
-            print(f"⚠️ [Qwen3-TTS] Failed with {attn_impl}, falling back to default attention: {e}")
-            model = Qwen3TTSModel.from_pretrained(final_source, device_map=device, dtype=dtype)
     
     # Apply patches
     apply_qwen3_patches(model)
