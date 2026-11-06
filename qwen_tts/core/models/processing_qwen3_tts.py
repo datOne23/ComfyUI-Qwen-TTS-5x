@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from transformers import AutoTokenizer
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.processing_utils import ProcessingKwargs, ProcessorMixin
 
@@ -42,6 +43,11 @@ class Qwen3TTSProcessor(ProcessorMixin):
         self, tokenizer=None, chat_template=None
     ):
         super().__init__(tokenizer, chat_template=chat_template)
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, **kwargs)
+        return cls(tokenizer=tokenizer)
 
     def __call__(self, text=None, **kwargs) -> BatchFeature:
         """

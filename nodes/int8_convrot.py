@@ -268,10 +268,13 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
     # --- 10. Text processor (needed for text tokenization in generate) ---
     processor = None
     try:
-        from transformers import AutoProcessor
-        processor = AutoProcessor.from_pretrained(source, fix_mistral_regex=True)
+        from transformers import AutoTokenizer
+        from qwen_tts.core.models.processing_qwen3_tts import Qwen3TTSProcessor
+        tokenizer = AutoTokenizer.from_pretrained(source, local_files_only=True)
+        processor = Qwen3TTSProcessor(tokenizer=tokenizer)
+        print(f"✅ [Qwen3-TTS] int8-convrot: processor loaded from {source}")
     except Exception as e:
-        print(f"⚠️ [Qwen3-TTS] int8-convrot: processor load skipped ({e})")
+        print(f"⚠️ [Qwen3-TTS] int8-convrot: processor load failed: {e}")
 
     # --- 11. Speech tokenizer (Base model only) --------------------------------
     if load_speech_tokenizer:
