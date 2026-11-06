@@ -82,7 +82,7 @@ def _get_parent_module(model, target_name):
 
 
 def _convert_linear_to_int8(model, skip_modules):
-    """Convert eligible Linear modules to bnb.nn.Int8Linear so a pre-quantized
+    """Convert eligible Linear modules to bnb.nn.Linear8bitLt so a pre-quantized
     state_dict (weight.int8 + weight.SCB) can be loaded without re-quantizing."""
     import bitsandbytes as bnb
 
@@ -96,6 +96,7 @@ def _convert_linear_to_int8(model, skip_modules):
             module.in_features,
             module.out_features,
             bias=(module.bias is not None),
+            has_fp16_weights=False,
         )
         if isinstance(parent, torch.nn.ModuleList):
             parent[int(child)] = new_module
