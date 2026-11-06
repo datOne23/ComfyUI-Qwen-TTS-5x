@@ -1119,13 +1119,26 @@ def unload_cached_model(cache_key=None):
         models_to_unload = list(_MODEL_CACHE.values())
         _MODEL_CACHE.clear()
 
-    # Move models to CPU before releasing references, so CUDA tensors are freed
+    # Move models to CPU and null out all references so CUDA tensors are freed
     for model in models_to_unload:
         try:
-            if hasattr(model, "model") and hasattr(model.model, "cpu"):
-                model.model = model.model.cpu()
+            if hasattr(model, "model") and model.model is not None:
+                if hasattr(model.model, "cpu"):
+                    model.model = model.model.cpu()
+                model.model = None
         except Exception:
             pass
+        try:
+            if hasattr(model, "processor"):
+                model.processor = None
+        except Exception:
+            pass
+        try:
+            model._unload_callback = None
+        except Exception:
+            pass
+
+    del models_to_unload
 
     model_management.soft_empty_cache()
     if torch.cuda.is_available():
@@ -1319,7 +1332,7 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
 
     # Clear old cache only when adding a new model with different config
     if _MODEL_CACHE:
-        _MODEL_CACHE.clear()
+        unload_cached_model()
     
     # --- 1. Determine search directories (ComfyUI model folders only) ---
     base_paths = _model_search_roots()
@@ -2764,3 +2777,37 @@ class LoadSpeakerNode:
         # Final Return (including the text)
         # Note: If prompt_items is None, the downstream VoiceCloneNode will extract it using its own settings.
         return (prompt_items, audio_preview, ref_text)
+ 
+class UnloadModelNode:
+    """
+    UnloadModel: Manually unload the cached Qwen3-TTS model from VRAM.
+
+    Use this node to free GPU memory after generation when
+    unload_model_after_generate is disabled, or to switch models without
+    reloading ComfyUI.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "unload_all": ("BOOLEAN", {"default": True, "tooltip": "Unload all cached models from VRAM."}),
+            },
+        }
+
+    RETURN_TYPES = ()
+    FUNCTION = "unload"
+    OUTPUT_NODE = True
+    CATEGORY = "Qwen3-TTS"
+    DESCRIPTION = "Unload cached Qwen3-TTS model(s) from VRAM to free GPU memory."
+
+    def unload(self, unload_all: bool = True):
+        if unload_all:
+            unload_cached_model()
+        else:
+            import torch
+            global _MODEL_CACHE
+            cuda_keys = [k for k in list(_MODEL_CACHE.keys()) if k[2] == "cuda"]
+            for key in cuda_keys:
+                unload_cached_model(key)
+        return {}
+
