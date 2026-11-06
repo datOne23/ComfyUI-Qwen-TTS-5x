@@ -4,6 +4,7 @@
 import copy as _copy_module
 import os
 import sys
+import warnings
 import torch
 import numpy as np
 import re
@@ -12,6 +13,9 @@ from typing import Dict, Any, List, Optional, Tuple, Union
 from contextlib import contextmanager
 import folder_paths
 import types
+
+# Suppress bitsandbytes MatMul8bitLt bf16->fp16 cast warning (harmless, fires every inference)
+warnings.filterwarnings("ignore", message=".*MatMul8bitLt.*inputs will be cast.*")
 
 from comfy import model_management
 from comfy.utils import ProgressBar
