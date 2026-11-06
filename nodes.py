@@ -92,7 +92,7 @@ def _convert_linear_to_int8(model, skip_modules):
         if any(skip in name for skip in skip_modules):
             continue
         parent, child = _get_parent_module(model, name)
-        new_module = bnb.nn.Int8Linear(
+        new_module = bnb.nn.Linear8bitLt(
             module.in_features,
             module.out_features,
             bias=(module.bias is not None),
@@ -113,7 +113,7 @@ def _load_int8_model(source, int8_source, **kwargs):
 
     When int8_source (a saved *_int8/pytorch_model.bin) is provided, load the
     plain bf16 model WITHOUT quantization_config (skipping the outlier scan +
-    int8 conversion), convert eligible Linear modules to Int8Linear, and load
+    int8 conversion),     convert eligible Linear modules to Linear8bitLt, and load
     the pre-quantized state_dict from disk. This is the fast path.
 
     When int8_source is None (first load), quantize on the fly via
