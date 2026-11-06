@@ -230,11 +230,12 @@ def _clamp_tokens(model, max_new_tokens):
     return max_new_tokens
 
 
-def _sampling(model, max_new_tokens, temperature, top_p, repetition_penalty):
+def _sampling(model, max_new_tokens, temperature, top_p, top_k, repetition_penalty):
     return dict(
         max_new_tokens=_clamp_tokens(model, int(max_new_tokens)),
         temperature=float(temperature),
         top_p=float(top_p),
+        top_k=int(top_k),
         repetition_penalty=float(repetition_penalty),
     )
 
@@ -422,14 +423,19 @@ class Qwen3TTSFastCustomVoice:
                 "text": ("STRING", {"multiline": True, "default": "Hello, this is a test."}),
                 "speaker": (SPEAKERS,),
                 "language": (LANGUAGES,),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
             },
             "optional": {
                 "instruct": ("STRING", {"multiline": True, "default": ""}),
-                "max_new_tokens": ("INT", {"default": 2048, "min": 1, "max": 8192}),
-                "temperature": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 2.0, "step": 0.05}),
-                "top_p": ("FLOAT", {"default": 0.8, "min": 0.1, "max": 1.0, "step": 0.05}),
-                "repetition_penalty": ("FLOAT", {"default": 1.1, "min": 1.0, "max": 2.0, "step": 0.05}),
+                "custom_model_path": ("STRING", {"default": ""}),
+                "custom_speaker_name": ("STRING", {"default": ""}),
+                "max_new_tokens": ("INT", {"default": 2048, "min": 512, "max": 4096, "step": 256}),
+                "temperature": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 2.0, "step": 0.1}),
+                "top_p": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "top_k": ("INT", {"default": 20, "min": 0, "max": 100, "step": 1}),
+                "repetition_penalty": ("FLOAT", {"default": 1.05, "min": 1.0, "max": 2.0, "step": 0.05}),
+                "attention": (ATTENTION_OPTIONS, {"default": "auto"}),
+                "unload_model_after_generate": ("BOOLEAN", {"default": False}),
             },
         }
 
@@ -438,22 +444,38 @@ class Qwen3TTSFastCustomVoice:
     CATEGORY = "Qwen3_TTS_Fast"
 
     def generate(self, model, text, speaker, language, seed, instruct="",
-                 max_new_tokens=2048, temperature=1.0, top_p=0.8, repetition_penalty=1.1):
+                 custom_model_path="", custom_speaker_name="",
+                 max_new_tokens=2048, temperature=1.0, top_p=0.8, top_k=20,
+                 repetition_penalty=1.05, attention="auto", unload_model_after_generate=False):
         m = _check(model)
         set_seed(seed)
-        kw = _sampling(m, max_new_tokens, temperature, top_p, repetition_penalty)
+        kw = _sampling(m, max_new_tokens, temperature, top_p, top_k, repetition_penalty)
         mapped_lang = LANGUAGE_MAP.get(language, "auto")
         instruct_arg = instruct if instruct and instruct.strip() else None
+        target_speaker = speaker
+        if custom_speaker_name and custom_speaker_name.strip():
+            target_speaker = custom_speaker_name.strip()
+        else:
+            target_speaker = speaker.lower().replace(" ", "_")
+        if custom_model_path and custom_model_path.strip():
+            print(f"[Qwen3-TTS Fast] custom_model_path '{custom_model_path}' is ignored by the vendored backend; using standard HF weights.")
         segments = parse_text_with_inline_tags(text)
 
         def render_custom(text_content):
             clean_text, combined_instruct = extract_emotion_instruct(text_content, instruct_arg)
             wavs, seg_sr = m.fast.generate_custom_voice(
-                text=clean_text, speaker=speaker, language=mapped_lang,
+                text=clean_text, speaker=target_speaker, language=mapped_lang,
                 instruct=combined_instruct or None, **kw)
             return wavs[0], seg_sr
 
         wavs, sr = _timed(lambda: _collect_segments(segments, render_custom))
+        if unload_model_after_generate:
+            _FAST_MODEL_CACHE.clear()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+            print("[Qwen3-TTS Fast] Model released after generation, VRAM freed.")
         return (_wav_to_audio(wavs, sr),)
 
 
@@ -468,13 +490,16 @@ class Qwen3TTSFastVoiceDesign:
                 "text": ("STRING", {"multiline": True, "default": "Hello, this is a test."}),
                 "instruct": ("STRING", {"multiline": True, "default": "A warm, gentle young female voice with clear pronunciation."}),
                 "language": (LANGUAGES,),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
             },
             "optional": {
-                "max_new_tokens": ("INT", {"default": 2048, "min": 1, "max": 8192}),
-                "temperature": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 2.0, "step": 0.05}),
-                "top_p": ("FLOAT", {"default": 0.8, "min": 0.1, "max": 1.0, "step": 0.05}),
-                "repetition_penalty": ("FLOAT", {"default": 1.1, "min": 1.0, "max": 2.0, "step": 0.05}),
+                "max_new_tokens": ("INT", {"default": 2048, "min": 512, "max": 4096, "step": 256}),
+                "temperature": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 2.0, "step": 0.1}),
+                "top_p": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "top_k": ("INT", {"default": 20, "min": 0, "max": 100, "step": 1}),
+                "repetition_penalty": ("FLOAT", {"default": 1.05, "min": 1.0, "max": 2.0, "step": 0.05}),
+                "attention": (ATTENTION_OPTIONS, {"default": "auto"}),
+                "unload_model_after_generate": ("BOOLEAN", {"default": False}),
             },
         }
 
@@ -483,10 +508,11 @@ class Qwen3TTSFastVoiceDesign:
     CATEGORY = "Qwen3_TTS_Fast"
 
     def generate(self, model, text, instruct, language, seed,
-                 max_new_tokens=2048, temperature=1.0, top_p=0.8, repetition_penalty=1.1):
+                 max_new_tokens=2048, temperature=1.0, top_p=0.8, top_k=20,
+                 repetition_penalty=1.05, attention="auto", unload_model_after_generate=False):
         m = _check(model)
         set_seed(seed)
-        kw = _sampling(m, max_new_tokens, temperature, top_p, repetition_penalty)
+        kw = _sampling(m, max_new_tokens, temperature, top_p, top_k, repetition_penalty)
         mapped_lang = LANGUAGE_MAP.get(language, "auto")
         instruct_arg = instruct if instruct and instruct.strip() else None
         segments = parse_text_with_inline_tags(text)
@@ -498,6 +524,13 @@ class Qwen3TTSFastVoiceDesign:
             return wavs[0], seg_sr
 
         wavs, sr = _timed(lambda: _collect_segments(segments, render_design))
+        if unload_model_after_generate:
+            _FAST_MODEL_CACHE.clear()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+            print("[Qwen3-TTS Fast] Model released after generation, VRAM freed.")
         return (_wav_to_audio(wavs, sr),)
 
 
@@ -513,14 +546,19 @@ class Qwen3TTSFastVoiceClone:
                 "ref_audio": ("AUDIO",),
                 "ref_text": ("STRING", {"multiline": True, "default": "Transcript of the reference audio"}),
                 "language": (LANGUAGES,),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
             },
             "optional": {
+                "voice_clone_prompt": ("QWEN3TTS_FAST_PROMPT",),
                 "x_vector_only": ("BOOLEAN", {"default": False}),
-                "max_new_tokens": ("INT", {"default": 2048, "min": 1, "max": 8192}),
-                "temperature": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 2.0, "step": 0.05}),
-                "top_p": ("FLOAT", {"default": 0.8, "min": 0.1, "max": 1.0, "step": 0.05}),
-                "repetition_penalty": ("FLOAT", {"default": 1.1, "min": 1.0, "max": 2.0, "step": 0.05}),
+                "custom_model_path": ("STRING", {"default": ""}),
+                "max_new_tokens": ("INT", {"default": 2048, "min": 512, "max": 4096, "step": 256}),
+                "temperature": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 2.0, "step": 0.1}),
+                "top_p": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "top_k": ("INT", {"default": 20, "min": 0, "max": 100, "step": 1}),
+                "repetition_penalty": ("FLOAT", {"default": 1.05, "min": 1.0, "max": 2.0, "step": 0.05}),
+                "attention": (ATTENTION_OPTIONS, {"default": "auto"}),
+                "unload_model_after_generate": ("BOOLEAN", {"default": False}),
             },
         }
 
@@ -529,25 +567,44 @@ class Qwen3TTSFastVoiceClone:
     CATEGORY = "Qwen3_TTS_Fast"
 
     def generate(self, model, text, ref_audio, ref_text, language, seed, x_vector_only=False,
-                 max_new_tokens=2048, temperature=1.0, top_p=0.8, repetition_penalty=1.1):
+                 custom_model_path="", voice_clone_prompt=None,
+                 max_new_tokens=2048, temperature=1.0, top_p=0.8, top_k=20,
+                 repetition_penalty=1.05, attention="auto", unload_model_after_generate=False):
         m = _check(model)
         set_seed(seed)
-        path, _, _ = _audio_to_ref_path(ref_audio)
-        kw = _sampling(m, max_new_tokens, temperature, top_p, repetition_penalty)
+        kw = _sampling(m, max_new_tokens, temperature, top_p, top_k, repetition_penalty)
         mapped_lang = LANGUAGE_MAP.get(language, "auto")
-        instruct_arg = None  # voice cloning carries no base instruct by default
+        instruct_arg = None
         segments = parse_text_with_inline_tags(text)
+
+        if custom_model_path and custom_model_path.strip():
+            print(f"[Qwen3-TTS Fast] custom_model_path '{custom_model_path}' is ignored by the vendored backend; using standard HF weights.")
 
         def render_clone(text_content):
             clean_text, combined_instruct = extract_emotion_instruct(text_content, instruct_arg)
-            wavs, seg_sr = m.fast.generate_voice_clone(
-                text=clean_text, language=mapped_lang, ref_audio=path,
-                ref_text="" if x_vector_only else ref_text,
-                xvec_only=bool(x_vector_only),
-                instruct=combined_instruct or None, **kw)
+            if voice_clone_prompt is not None:
+                wavs, seg_sr = m.fast.generate_voice_clone(
+                    text=clean_text, language=mapped_lang,
+                    voice_clone_prompt=voice_clone_prompt["items"],
+                    ref_text=voice_clone_prompt["ref_text"], xvec_only=bool(x_vector_only),
+                    instruct=combined_instruct or None, **kw)
+            else:
+                path, _, _ = _audio_to_ref_path(ref_audio)
+                wavs, seg_sr = m.fast.generate_voice_clone(
+                    text=clean_text, language=mapped_lang, ref_audio=path,
+                    ref_text="" if x_vector_only else ref_text,
+                    xvec_only=bool(x_vector_only),
+                    instruct=combined_instruct or None, **kw)
             return wavs[0], seg_sr
 
         wavs, sr = _timed(lambda: _collect_segments(segments, render_clone))
+        if unload_model_after_generate:
+            _FAST_MODEL_CACHE.clear()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+            print("[Qwen3-TTS Fast] Model released after generation, VRAM freed.")
         return (_wav_to_audio(wavs, sr),)
 
 
@@ -563,14 +620,17 @@ class Qwen3TTSFastVoiceCloneFromFile:
                 "ref_audio_path": ("STRING", {"default": "C:/path/to/audio.wav"}),
                 "ref_text": ("STRING", {"multiline": True, "default": "Transcript of the reference audio"}),
                 "language": (LANGUAGES,),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
             },
             "optional": {
                 "x_vector_only": ("BOOLEAN", {"default": False}),
-                "max_new_tokens": ("INT", {"default": 2048, "min": 1, "max": 8192}),
-                "temperature": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 2.0, "step": 0.05}),
-                "top_p": ("FLOAT", {"default": 0.8, "min": 0.1, "max": 1.0, "step": 0.05}),
-                "repetition_penalty": ("FLOAT", {"default": 1.1, "min": 1.0, "max": 2.0, "step": 0.05}),
+                "max_new_tokens": ("INT", {"default": 2048, "min": 512, "max": 4096, "step": 256}),
+                "temperature": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 2.0, "step": 0.1}),
+                "top_p": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "top_k": ("INT", {"default": 20, "min": 0, "max": 100, "step": 1}),
+                "repetition_penalty": ("FLOAT", {"default": 1.05, "min": 1.0, "max": 2.0, "step": 0.05}),
+                "attention": (ATTENTION_OPTIONS, {"default": "auto"}),
+                "unload_model_after_generate": ("BOOLEAN", {"default": False}),
             },
         }
 
@@ -579,12 +639,13 @@ class Qwen3TTSFastVoiceCloneFromFile:
     CATEGORY = "Qwen3_TTS_Fast"
 
     def generate(self, model, text, ref_audio_path, ref_text, language, seed, x_vector_only=False,
-                 max_new_tokens=2048, temperature=1.0, top_p=0.8, repetition_penalty=1.1):
+                 max_new_tokens=2048, temperature=1.0, top_p=0.8, top_k=20,
+                 repetition_penalty=1.05, attention="auto", unload_model_after_generate=False):
         m = _check(model)
         if not os.path.isfile(ref_audio_path):
             raise RuntimeError(f"Reference audio not found: {ref_audio_path}")
         set_seed(seed)
-        kw = _sampling(m, max_new_tokens, temperature, top_p, repetition_penalty)
+        kw = _sampling(m, max_new_tokens, temperature, top_p, top_k, repetition_penalty)
         mapped_lang = LANGUAGE_MAP.get(language, "auto")
         segments = parse_text_with_inline_tags(text)
 
@@ -598,6 +659,13 @@ class Qwen3TTSFastVoiceCloneFromFile:
             return wavs[0], seg_sr
 
         wavs, sr = _timed(lambda: _collect_segments(segments, render_clone))
+        if unload_model_after_generate:
+            _FAST_MODEL_CACHE.clear()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+            print("[Qwen3-TTS Fast] Model released after generation, VRAM freed.")
         return (_wav_to_audio(wavs, sr),)
 
 
@@ -640,13 +708,16 @@ class Qwen3TTSFastCloneWithPrompt:
                 "text": ("STRING", {"multiline": True, "default": "Hello, this is a test."}),
                 "clone_prompt": ("QWEN3TTS_FAST_PROMPT",),
                 "language": (LANGUAGES,),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
             },
             "optional": {
-                "max_new_tokens": ("INT", {"default": 2048, "min": 1, "max": 8192}),
-                "temperature": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 2.0, "step": 0.05}),
-                "top_p": ("FLOAT", {"default": 0.8, "min": 0.1, "max": 1.0, "step": 0.05}),
-                "repetition_penalty": ("FLOAT", {"default": 1.1, "min": 1.0, "max": 2.0, "step": 0.05}),
+                "max_new_tokens": ("INT", {"default": 2048, "min": 512, "max": 4096, "step": 256}),
+                "temperature": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 2.0, "step": 0.1}),
+                "top_p": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "top_k": ("INT", {"default": 20, "min": 0, "max": 100, "step": 1}),
+                "repetition_penalty": ("FLOAT", {"default": 1.05, "min": 1.0, "max": 2.0, "step": 0.05}),
+                "attention": (ATTENTION_OPTIONS, {"default": "auto"}),
+                "unload_model_after_generate": ("BOOLEAN", {"default": False}),
             },
         }
 
@@ -655,10 +726,11 @@ class Qwen3TTSFastCloneWithPrompt:
     CATEGORY = "Qwen3_TTS_Fast"
 
     def generate(self, model, text, clone_prompt, language, seed,
-                 max_new_tokens=2048, temperature=1.0, top_p=0.8, repetition_penalty=1.1):
+                 max_new_tokens=2048, temperature=1.0, top_p=0.8, top_k=20,
+                 repetition_penalty=1.05, attention="auto", unload_model_after_generate=False):
         m = _check(model)
         set_seed(seed)
-        kw = _sampling(m, max_new_tokens, temperature, top_p, repetition_penalty)
+        kw = _sampling(m, max_new_tokens, temperature, top_p, top_k, repetition_penalty)
         mapped_lang = LANGUAGE_MAP.get(language, "auto")
         segments = parse_text_with_inline_tags(text)
 
@@ -671,6 +743,13 @@ class Qwen3TTSFastCloneWithPrompt:
             return wavs[0], seg_sr
 
         wavs, sr = _timed(lambda: _collect_segments(segments, render_prompt))
+        if unload_model_after_generate:
+            _FAST_MODEL_CACHE.clear()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+            print("[Qwen3-TTS Fast] Model released after generation, VRAM freed.")
         return (_wav_to_audio(wavs, sr),)
 
 
@@ -685,16 +764,19 @@ class Qwen3TTSFastBatchGenerate:
                 "text_list": ("STRING", {"multiline": True, "default": "Line 1\nLine 2\nLine 3"}),
                 "separator": ("STRING", {"default": "\n"}),
                 "language": (LANGUAGES,),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True}),
             },
             "optional": {
                 "speaker": (SPEAKERS,),
                 "clone_prompt": ("QWEN3TTS_FAST_PROMPT",),
                 "increment_seed": ("BOOLEAN", {"default": True}),
-                "max_new_tokens": ("INT", {"default": 2048, "min": 1, "max": 8192}),
-                "temperature": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 2.0, "step": 0.05}),
-                "top_p": ("FLOAT", {"default": 0.8, "min": 0.1, "max": 1.0, "step": 0.05}),
-                "repetition_penalty": ("FLOAT", {"default": 1.1, "min": 1.0, "max": 2.0, "step": 0.05}),
+                "max_new_tokens": ("INT", {"default": 2048, "min": 512, "max": 4096, "step": 256}),
+                "temperature": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 2.0, "step": 0.1}),
+                "top_p": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "top_k": ("INT", {"default": 20, "min": 0, "max": 100, "step": 1}),
+                "repetition_penalty": ("FLOAT", {"default": 1.05, "min": 1.0, "max": 2.0, "step": 0.05}),
+                "attention": (ATTENTION_OPTIONS, {"default": "auto"}),
+                "unload_model_after_generate": ("BOOLEAN", {"default": False}),
             },
         }
 
@@ -705,14 +787,15 @@ class Qwen3TTSFastBatchGenerate:
 
     def generate_batch(self, model, text_list, separator, language, seed,
                        speaker="Vivian", clone_prompt=None, increment_seed=True,
-                       max_new_tokens=2048, temperature=1.0, top_p=0.8, repetition_penalty=1.1):
+                       max_new_tokens=2048, temperature=1.0, top_p=0.8, top_k=20,
+                       repetition_penalty=1.05, attention="auto", unload_model_after_generate=False):
         m = _check(model)
         sep = separator if separator else "\n"
         texts = [t.strip() for t in text_list.split(sep) if t.strip()]
         if not texts:
             raise RuntimeError("text_list is empty after splitting on the separator.")
 
-        kw = _sampling(m, max_new_tokens, temperature, top_p, repetition_penalty)
+        kw = _sampling(m, max_new_tokens, temperature, top_p, top_k, repetition_penalty)
         mapped_lang = LANGUAGE_MAP.get(language, "auto")
 
         if torch.cuda.is_available():
@@ -745,6 +828,14 @@ class Qwen3TTSFastBatchGenerate:
         print("\n[Qwen3-TTS Fast Batch Stats]")
         print(f"  {len(texts)} clips | {duration:.2f}s audio in {elapsed:.2f}s ({rtf:.2f}x Real-Time)")
         print("-" * 30)
+
+        if unload_model_after_generate:
+            _FAST_MODEL_CACHE.clear()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+            print("[Qwen3-TTS Fast] Model released after batch generation, VRAM freed.")
 
         return (audios,)
 

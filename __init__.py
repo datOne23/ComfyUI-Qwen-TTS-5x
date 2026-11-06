@@ -83,5 +83,19 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 
 # Version information
 __version__ = "1.0.7"
+__author__ = "jesse890423"
+__title__ = "ComfyUI-Qwen-TTS-5x"
+__description__ = "ComfyUI custom nodes for Qwen3-TTS, patched for transformers 5.x compatibility (verified on 5.14.1)"
+__license__ = "MIT"
+
+__all__ = [
+    "NODE_CLASS_MAPPINGS",
+    "NODE_DISPLAY_NAME_MAPPINGS",
+    "__version__",
+    "__author__",
+    "__title__",
+    "__description__",
+    "__license__",
+]
 
 print(f"✅ ComfyUI-Qwen-TTS-5x v{__version__} loaded")
