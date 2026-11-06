@@ -98,3 +98,41 @@ __all__ = [
     "_resolve_within",
     "_register_safe_globals",
 ]
+
+
+# --- ComfyUI native unload hook -------------------------------------------
+# Models loaded via HuggingFace accelerate dispatch (device_map="cuda") are not
+# tracked by comfy.model_management.current_loaded_models, so ComfyUI's native
+# "Free model cache" button (→ unload_all_models / cleanup_models) never sees
+# them and the VRAM is never reclaimed. Patch those entry points to also run
+# our unload_cached_model() so the button works for this plugin too.
+def _install_comfy_unload_hooks():
+    try:
+        import comfy.model_management as mm
+    except Exception:
+        return
+    if getattr(mm, "_qwen3_tts_hooked", False):
+        return
+
+    from .model import unload_cached_model
+
+    def _wrap(orig, label):
+        def _patched(*args, **kwargs):
+            try:
+                unload_cached_model()
+            except Exception as e:
+                print(f"[Qwen3-TTS] unload during {label} failed: {e}")
+            return orig(*args, **kwargs)
+
+        _patched._qwen3_tts_wrapped = True
+        return _patched
+
+    for name in ("unload_all_models", "cleanup_models"):
+        orig = getattr(mm, name, None)
+        if orig is not None and not getattr(orig, "_qwen3_tts_wrapped", False):
+            setattr(mm, name, _wrap(orig, name))
+
+    mm._qwen3_tts_hooked = True
+
+
+_install_comfy_unload_hooks()
