@@ -806,8 +806,27 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
             print("[Qwen3-TTS] quantization='int8' requested but bitsandbytes/transformers BitsAndBytesConfig is not installed. Falling back to unquantized bf16/fp32.")
         else:
             try:
-                quant_config = BitsAndBytesConfig(load_in_8bit=True)
-                print("[Qwen3-TTS] int8 quantization enabled")
+                # Layers that must stay in bf16 to avoid garbled audio output.
+                # Qwen3-TTS has Talker + Code Predictor + Speaker Encoder + Codec/Vocoder;
+                # the codec/vocoder/speaker-encoder layers are sensitive to the bf16->fp16 cast
+                # that bitsandbytes applies during quantized matmul. Keep them in bf16.
+                skip_modules = [
+                    "lm_head",
+                    "output_proj",
+                    "codec_encoder",
+                    "codec_decoder",
+                    "speaker_encoder",
+                    "vocoder",
+                    "seanet",
+                    "audio_codec",
+                    "decoder",
+                    "feature_projection",
+                ]
+                quant_config = BitsAndBytesConfig(
+                    load_in_8bit=True,
+                    llm_int8_skip_modules=skip_modules,
+                )
+                print("[Qwen3-TTS] int8 quantization enabled (skip_modules=%s)" % skip_modules)
             except Exception as e:
                 print(f"⚠️ [Qwen3-TTS] Failed to build BitsAndBytesConfig: {e}. Falling back to unquantized bf16/fp32.")
                 quant_config = None
@@ -872,6 +891,19 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
         else:
             # Fall back to remote loading if download failed
             print(f"🌐 [Qwen3-TTS] Loading remote model: {final_source}")
+
+    # --- int8 pre-quantized folder check (quantize once, load from disk) ---
+    int8_source = None
+    if quantization == "int8":
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        comfy_models_path = os.path.join(os.path.dirname(os.path.dirname(current_dir)), "models")
+        qwen_root = os.path.join(comfy_models_path, "qwen-tts")
+        model_name = os.path.basename(final_source)
+        int8_folder = os.path.join(qwen_root, model_name + "_int8")
+        if os.path.isdir(int8_folder):
+            int8_source = int8_folder
+            final_source = int8_source
+            print(f"🔧 [Qwen3-TTS] Loading pre-quantized int8 model from: {int8_folder}")
 
     if Qwen3TTSModel is None:
         raise RuntimeError(
@@ -966,6 +998,20 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
     apply_qwen3_patches(model)
     
     _MODEL_CACHE[cache_key] = model
+
+    # --- save int8 model to disk for faster future loads ---
+    if quantization == "int8":
+        try:
+            model_name = os.path.basename(final_source)
+            int8_folder = os.path.join(qwen_root, model_name + "_int8")
+            if not os.path.exists(int8_folder):
+                print(f"💾 [Qwen3-TTS] Saving int8 model to: {int8_folder}")
+                os.makedirs(int8_folder, exist_ok=True)
+                model.model.save_pretrained(int8_folder)
+                model.processor.save_pretrained(int8_folder)
+                print(f"✅ [Qwen3-TTS] int8 model saved.")
+        except Exception as e:
+            print(f"⚠️ [Qwen3-TTS] Failed to save int8 model: {e}")
     
     if unload_after:
         def unload_callback():
