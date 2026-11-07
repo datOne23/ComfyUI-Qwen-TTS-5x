@@ -429,7 +429,10 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
         try:
             from qwen_tts import Qwen3TTSTokenizer
             speech_tokenizer = Qwen3TTSTokenizer.from_pretrained(st_dir, local_files_only=True)
+            speech_tokenizer.model.to(device=device)
+            speech_tokenizer.device = torch.device(device)
             model.load_speech_tokenizer(speech_tokenizer)
+            print(f"✅ [Qwen3-TTS] codec moved to {next(speech_tokenizer.model.parameters()).device}")
             print(f"✅ [Qwen3-TTS] int8-convrot: speech tokenizer loaded from {st_dir}")
         except Exception as e:
             raise RuntimeError(

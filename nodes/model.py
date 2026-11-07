@@ -387,6 +387,10 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
             load_kwargs["attn_implementation"] = attn_param
         print(f"🔧 [Qwen3-TTS] Loading model with attention: {attn_impl}")
         model = Qwen3TTSModel.from_pretrained(final_source, **load_kwargs)
+        if hasattr(model, 'speech_tokenizer') and model.speech_tokenizer is not None:
+            model.speech_tokenizer.model.to(device=device)
+            model.speech_tokenizer.device = torch.device(device)
+            print(f"✅ [Qwen3-TTS] codec moved to {next(model.speech_tokenizer.model.parameters()).device}")
 
     # Apply patches
     apply_qwen3_patches(model)
