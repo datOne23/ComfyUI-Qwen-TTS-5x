@@ -144,14 +144,25 @@ def _render_segments(segments: List[Tuple[str, Union[str, float]]], render_one, 
     Returns {"waveform": torch.Tensor [1, 1, N], "sample_rate": sr}.
     """
     audio_results = []
-    sr = default_sr
+    sr = None
+    pending_pause = 0.0
     for seg_type, content in segments:
         if seg_type == "pause":
             if content and float(content) > 0:
-                audio_results.append(np.zeros(int(float(content) * sr), dtype=np.float32))
+                pending_pause += float(content)
         else:
             wav, seg_sr = render_one(content)
-            sr = seg_sr
+            seg_sr = int(seg_sr) if seg_sr else int(default_sr)
+            if sr is None:
+                sr = seg_sr
+            elif seg_sr != sr:
+                raise RuntimeError(
+                    f"Speech tokenizer sample rate changed during render ({sr} -> {seg_sr}). "
+                    f"All segments must use the same output sample rate."
+                )
+            if pending_pause > 0:
+                audio_results.append(np.zeros(int(round(pending_pause * sr)), dtype=np.float32))
+                pending_pause = 0.0
             if isinstance(wav, torch.Tensor):
                 wav = wav.cpu().numpy()
             wav = np.asarray(wav, dtype=np.float32)
@@ -159,6 +170,10 @@ def _render_segments(segments: List[Tuple[str, Union[str, float]]], render_one, 
             while wav.ndim > 1:
                 wav = np.mean(wav, axis=0)
             audio_results.append(np.ravel(wav))
+    if sr is None:
+        sr = int(default_sr)
+    if pending_pause > 0 and audio_results:
+        audio_results.append(np.zeros(int(round(pending_pause * sr)), dtype=np.float32))
     if not audio_results:
         raise RuntimeError("No audio generated from inline tag segments.")
     full = np.concatenate(audio_results)

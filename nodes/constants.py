@@ -84,6 +84,17 @@ MODEL_FAMILY_TO_HF = {
     "1.7B": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
 }
 
+# Speech tokenizer options (output sample rate)
+SPEECH_TOKENIZER_CHOICES = ["24kHz (default)", "48kHz"]
+SPEECH_TOKENIZER_FOLDERS = {
+    "24kHz (default)": "Qwen3-TTS-Tokenizer-12Hz",
+    "48kHz": "Qwen3-TTS-Tokenizer-12Hz-48kHz",
+}
+SPEECH_TOKENIZER_REPOS = {
+    "24kHz (default)": "Qwen/Qwen3-TTS-Tokenizer-12Hz",
+    "48kHz": "takuma104/Qwen3-TTS-Tokenizer-12Hz-48kHz",
+}
+
 # All required models for batch download
 ALL_MODELS = [
     "Qwen/Qwen3-TTS-Tokenizer-12Hz",
@@ -93,6 +104,7 @@ ALL_MODELS = [
     "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
     "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 ]
+ALL_MODELS_WITH_48K = list(ALL_MODELS) + ["takuma104/Qwen3-TTS-Tokenizer-12Hz-48kHz"]
 
 _MODELS_CHECKED = False
 _MODEL_CACHE = {}

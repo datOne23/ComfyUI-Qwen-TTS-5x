@@ -157,7 +157,7 @@ def apply_qwen3_patches(model):
                 raise ValueError("For numpy waveform input, pass a tuple (audio, sr).")
             else:
                 # If we still can't identify it, it might be the cause of our NoneType or other issues
-                print(f"⚠️ [Qwen3-TTS] Unknown audio input type: {type(a)}")
+                print(f"[Qwen3-TTS] Unknown audio input type: {type(a)}")
                 continue
 
         # ensure mono
@@ -170,7 +170,7 @@ def apply_qwen3_patches(model):
     try:
         model._normalize_audio_inputs = types.MethodType(_safe_normalize, model)
     except Exception as e:
-        print(f"⚠️ [Qwen3-TTS] Failed to apply audio normalization patch: {e}")
+        print(f"[Qwen3-TTS] Failed to apply audio normalization patch: {e}")
 
 
 def download_model_if_needed(model_id: str, qwen_root: str) -> str:
@@ -182,7 +182,7 @@ def download_model_if_needed(model_id: str, qwen_root: str) -> str:
         # Model already exists
         return target_dir
 
-    print(f"\n📥 [Qwen3-TTS] Downloading {model_id}...")
+    print(f"\n[Qwen3-TTS] Downloading {model_id}...")
     try:
         from huggingface_hub import snapshot_download
         # Temporarily allow network for first-time download. HF_HUB_OFFLINE and
@@ -203,13 +203,13 @@ def download_model_if_needed(model_id: str, qwen_root: str) -> str:
                 os.environ["TRANSFORMERS_OFFLINE"] = prev_tr_offline
             else:
                 os.environ.pop("TRANSFORMERS_OFFLINE", None)
-        print(f"✅ [Qwen3-TTS] {folder_name} downloaded successfully.\n")
+        print(f"[Qwen3-TTS] {folder_name} downloaded successfully.\n")
         return target_dir
     except ImportError:
-        print("⚠️ [Qwen3-TTS] 'huggingface_hub' not found. Please install it to use auto-download.")
+        print("[Qwen3-TTS] 'huggingface_hub' not found. Please install it to use auto-download.")
         return None
     except Exception as e:
-        print(f"❌ [Qwen3-TTS] Failed to download {model_id}: {e}")
+        print(f"[Qwen3-TTS] Failed to download {model_id}: {e}")
         return None
 
 
@@ -228,10 +228,157 @@ def check_and_download_tokenizer():
     constants._MODELS_CHECKED = True
 
 
-def load_qwen_model(model_type: str, model_choice: str, device: str, precision: str, quantization: str = "none", attention: str = "auto", unload_after: bool = False, previous_attention: str = None, custom_model_path: Optional[str] = None):
+def get_qwen_models_root() -> str:
+    qwen_root = os.path.join(MODELS_DIR, "qwen-tts")
+    os.makedirs(qwen_root, exist_ok=True)
+    return qwen_root
+
+
+def resolve_speech_tokenizer_dir(speech_tokenizer: str, qwen_root: Optional[str] = None) -> Optional[str]:
+    """Resolve an optional speech tokenizer directory.
+
+    Returns None for the 24kHz default, meaning "use the model-bundled tokenizer"
+    and preserve the exact existing load path. For non-default choices, returns a
+    validated tokenizer directory or raises a clear RuntimeError if missing.
+    """
+    choice = speech_tokenizer or "24kHz (default)"
+    if choice in ("24kHz (default)", "24kHz", "Qwen3-TTS-Tokenizer-12Hz"):
+        check_and_download_tokenizer()
+        return None
+
+    root = qwen_root or get_qwen_models_root()
+    folder = constants.SPEECH_TOKENIZER_FOLDERS.get(choice)
+    repo = constants.SPEECH_TOKENIZER_REPOS.get(choice)
+    if not folder:
+        folder = str(choice)
+        repo = repo or (f"takuma104/{folder}" if "48kHz" in folder else folder)
+
+    target_dir = os.path.join(root, folder)
+    cfg_path = os.path.join(target_dir, "config.json")
+    if os.path.isdir(target_dir) and os.path.isfile(cfg_path):
+        return target_dir
+
+    repo_hint = f" Hugging Face repo: {repo}." if repo else ""
+    raise RuntimeError(
+        f"Speech tokenizer '{choice}' is not installed. "
+        f"Expected folder: {target_dir} (must contain config.json and model weights).{repo_hint} "
+        f"Download it manually or run `python download_models.py --with-48k-tokenizer`. "
+        f"The 48kHz tokenizer is a third-party Apache-2.0 fine-tune (base: Qwen/Qwen3-TTS-Tokenizer-12Hz) "
+        f"with 24kHz input and 48kHz output; it is never auto-downloaded and 24kHz is never used as a fallback."
+    )
+
+
+def _codec_target_dtype(codec_model, compute_dtype):
+    try:
+        first = next(codec_model.parameters())
+    except StopIteration:
+        return None
+    if first.is_floating_point() and first.dtype != compute_dtype:
+        return compute_dtype
+    return None
+
+
+def _move_and_cast_codec(speech_tokenizer, device: str, dtype, label: str = "codec"):
+    if speech_tokenizer is None:
+        print(f"[Qwen3-TTS] {label} move skipped - speech tokenizer not found")
+        return
+    st_model = getattr(speech_tokenizer, "model", speech_tokenizer)
+    try:
+        st_model.to(device=device)
+    except Exception as e:
+        print(f"[Qwen3-TTS] {label} move to {device} failed: {e}")
+    try:
+        speech_tokenizer.device = torch.device(device)
+    except Exception:
+        pass
+    try:
+        _codec_dev = next(st_model.parameters()).device
+    except StopIteration:
+        _codec_dev = "unknown"
+    print(f"[Qwen3-TTS] {label} moved to {_codec_dev}")
+    target_dtype = _codec_target_dtype(st_model, dtype)
+    if target_dtype is not None:
+        try:
+            before = next(st_model.parameters()).dtype
+            speech_tokenizer.model = st_model.to(target_dtype)
+            print(f"[Qwen3-TTS] {label} cast {before} -> {target_dtype}")
+        except StopIteration:
+            pass
+
+
+def _apply_speech_tokenizer_override(model, speech_tokenizer_choice: str, qwen_root: str, device: str, dtype):
+    tok_dir = resolve_speech_tokenizer_dir(speech_tokenizer_choice, qwen_root)
+    if tok_dir is None:
+        return speech_tokenizer_choice or "24kHz (default)"
+
+    from qwen_tts import Qwen3TTSTokenizer
+
+    inner = getattr(model, "model", model)
+    print(f"[Qwen3-TTS] Loading speech tokenizer override: {tok_dir}")
+    st = Qwen3TTSTokenizer.from_pretrained(tok_dir, local_files_only=True)
+    _move_and_cast_codec(st, device=device, dtype=dtype, label="speech tokenizer")
+    if hasattr(inner, "load_speech_tokenizer"):
+        inner.load_speech_tokenizer(st)
+    elif hasattr(inner, "speech_tokenizer"):
+        inner.speech_tokenizer = st
+    else:
+        raise RuntimeError(
+            "Selected speech tokenizer could not be attached to the loaded TTS model "
+            "(no load_speech_tokenizer/speech_tokenizer attribute)."
+        )
+    try:
+        out_sr = int(st.get_output_sample_rate())
+    except Exception:
+        out_sr = 48000
+    print(f"[Qwen3-TTS] Speech tokenizer active: {speech_tokenizer_choice} ({out_sr} Hz output)")
+    return speech_tokenizer_choice
+
+
+def get_model_output_sample_rate(model, default_sr: int = 24000) -> int:
+    """Return the active speech tokenizer output sample rate for a loaded model."""
+    if model is None:
+        return int(default_sr)
+    candidates = [model]
+    inner = getattr(model, "model", None)
+    if inner is not None:
+        candidates.insert(0, inner)
+    for obj in candidates:
+        st = getattr(obj, "speech_tokenizer", None)
+        if st is None:
+            continue
+        for target in (st, getattr(st, "model", None)):
+            if target is None:
+                continue
+            getter = getattr(target, "get_output_sample_rate", None)
+            if callable(getter):
+                try:
+                    sr = int(getter())
+                    if sr > 0:
+                        return sr
+                except Exception:
+                    pass
+            for attr in ("output_sample_rate", "sampling_rate", "sample_rate"):
+                try:
+                    sr = int(getattr(target, attr))
+                    if sr > 0:
+                        return sr
+                except Exception:
+                    pass
+            cfg = getattr(target, "config", None)
+            for attr in ("output_sample_rate", "sampling_rate", "sample_rate"):
+                try:
+                    sr = int(getattr(cfg, attr))
+                    if sr > 0:
+                        return sr
+                except Exception:
+                    pass
+    return int(default_sr)
+
+
+def load_qwen_model(model_type: str, model_choice: str, device: str, precision: str, quantization: str = "none", attention: str = "auto", unload_after: bool = False, previous_attention: str = None, custom_model_path: Optional[str] = None, speech_tokenizer: str = "24kHz (default)"):
     """Shared model loading logic with caching and local path priority"""
     if previous_attention is not None and previous_attention != attention:
-        print(f"🔄 [Qwen3-TTS] Attention changed from '{previous_attention}' to '{attention}', clearing cache...")
+        print(f"[Qwen3-TTS] Attention changed from '{previous_attention}' to '{attention}', clearing cache...")
         unload_cached_model()
 
     attn_impl = get_attention_implementation(attention)
@@ -241,8 +388,9 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
     # an arbitrary folder or a remote share.
     custom_dir = _resolve_custom_model_dir(custom_model_path)
 
-    # Check and download tokenizer (shared by all models)
-    check_and_download_tokenizer()
+    qwen_root = get_qwen_models_root()
+    tok_dir = resolve_speech_tokenizer_dir(speech_tokenizer, qwen_root)
+    tok_cache_id = tok_dir or "bundled"
 
     # Determine device
     if device == "auto":
@@ -262,11 +410,11 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
 
     # VoiceDesign restriction
     if model_type == "VoiceDesign" and model_choice == "0.6B":
-        raise RuntimeError("❌ VoiceDesign only supports 1.7B models!")
+        raise RuntimeError("VoiceDesign only supports 1.7B models!")
 
     # Cache key includes attention implementation, the resolved model folder,
-    # and the quantization setting so int8-convrot vs none do not collide
-    cache_key = (model_type, model_choice, device, precision, quantization, attn_impl, custom_dir)
+    # quantization, and speech tokenizer identity.
+    cache_key = (model_type, model_choice, device, precision, quantization, attn_impl, custom_dir, tok_cache_id)
     if cache_key in constants._MODEL_CACHE:
         return constants._MODEL_CACHE[cache_key]
 
@@ -290,13 +438,14 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
     found_local = None
 
     if custom_dir:
-        print(f"🔧 [Qwen3-TTS] Using custom model folder: {custom_dir}")
+        print(f"[Qwen3-TTS] Using custom model folder: {custom_dir}")
         found_local = custom_dir
 
     if not found_local:
         for base in base_paths:
             try:
-                if not os.path.isdir(base): continue
+                if not os.path.isdir(base):
+                    continue
                 subdirs = os.listdir(base)
                 for d in subdirs:
                     cand = os.path.join(base, d)
@@ -305,29 +454,29 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
                         if model_choice in d and model_type.lower() in d.lower():
                             found_local = cand
                             break
-                if found_local: break
-            except Exception: pass
+                if found_local:
+                    break
+            except Exception:
+                pass
 
     if found_local:
         final_source = found_local
-        print(f"✅ [Qwen3-TTS] Loading local model: {os.path.basename(final_source)}")
+        print(f"[Qwen3-TTS] Loading local model: {os.path.basename(final_source)}")
     else:
         # Try to download the specific model if not found locally
-        qwen_root = os.path.join(MODELS_DIR, "qwen-tts")
-
         downloaded_path = download_model_if_needed(final_source, qwen_root)
         if downloaded_path:
             final_source = downloaded_path
-            print(f"✅ [Qwen3-TTS] Loading downloaded model: {os.path.basename(final_source)}")
+            print(f"[Qwen3-TTS] Loading downloaded model: {os.path.basename(final_source)}")
         else:
             raise RuntimeError(
-                f"❌ [Qwen3-TTS] Model '{final_source}' not found locally and auto-download failed. "
+                f"[Qwen3-TTS] Model '{final_source}' not found locally and auto-download failed. "
                 f"Download it manually into {qwen_root} or check network/HF access."
             )
 
     if Qwen3TTSModel is None:
         raise RuntimeError(
-            "❌ [Qwen3-TTS] Model class is not loaded because the 'qwen_tts' package failed to import. "
+            "[Qwen3-TTS] Model class is not loaded because the 'qwen_tts' package failed to import. "
             "Please check the ComfyUI console for the detailed 'Critical Import Error' above."
         )
 
@@ -354,24 +503,25 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
             print("[Qwen3-TTS] int8-convrot requires CUDA; falling back to bf16.")
             quantization = "none"
         else:
-            qwen_root = os.path.join(MODELS_DIR, "qwen-tts")
             model_name = os.path.basename(final_source)
             int8_convrot_path = os.path.join(qwen_root, model_name + "_int8_convrot.safetensors")
             if os.path.exists(int8_convrot_path):
-                print(f"🔧 [Qwen3-TTS] int8-convrot: loading pre-quantized weights from disk: {int8_convrot_path}")
+                print(f"[Qwen3-TTS] int8-convrot: loading pre-quantized weights from disk: {int8_convrot_path}")
                 model = load_int8_convrot_model(
                     final_source, int8_convrot_path, device=device, dtype=dtype,
                     attn_implementation=attn_param,
                     load_speech_tokenizer=True,
+                    speech_tokenizer_dir=tok_dir,
                 )
                 convrot_loaded = True
             else:
-                print(f"🔧 [Qwen3-TTS] int8-convrot: no saved weights found at {int8_convrot_path}; running first-time conversion...")
+                print(f"[Qwen3-TTS] int8-convrot: no saved weights found at {int8_convrot_path}; running first-time conversion...")
                 model = load_int8_convrot_model(
                     final_source, int8_convrot_path, device=device, dtype=dtype,
                     attn_implementation=attn_param,
                     load_speech_tokenizer=True,
                     auto_convert=True,
+                    speech_tokenizer_dir=tok_dir,
                 )
                 convrot_loaded = True
 
@@ -385,32 +535,13 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
         }
         if attn_param:
             load_kwargs["attn_implementation"] = attn_param
-        print(f"🔧 [Qwen3-TTS] Loading model with attention: {attn_impl}")
+        print(f"[Qwen3-TTS] Loading model with attention: {attn_impl}")
         model = Qwen3TTSModel.from_pretrained(final_source, **load_kwargs)
         # Speech tokenizer lives on the inner HF model (wrap.model), not the wrapper
         _inner = getattr(model, 'model', None)
         _st = getattr(_inner, 'speech_tokenizer', None) if _inner is not None else None
-        if _st is not None:
-            _st.model.to(device=device)
-            try:
-                _st.device = torch.device(device)
-            except AttributeError:
-                print("[Qwen3-TTS] speech_tokenizer.device not settable; relies on device_map")
-            try:
-                _codec_dev = next(_st.model.parameters()).device
-            except StopIteration:
-                _codec_dev = "unknown"
-            print(f"✅ [Qwen3-TTS] codec moved to {_codec_dev}")
-            # Cast codec dtype to match compute dtype
-            try:
-                _first = next(_st.model.parameters())
-                if _first.dtype != dtype and _first.is_floating_point():
-                    _st.model = _st.model.to(dtype)
-                    print(f"🔧 [Qwen3-TTS] codec cast {_first.dtype} -> {dtype}")
-            except StopIteration:
-                pass
-        else:
-            print("⚠️ [Qwen3-TTS] codec move skipped — speech tokenizer not found on bf16 model")
+        _move_and_cast_codec(_st, device=device, dtype=dtype, label="codec")
+        _apply_speech_tokenizer_override(model, speech_tokenizer, qwen_root, device, dtype)
 
     # Apply patches
     apply_qwen3_patches(model)

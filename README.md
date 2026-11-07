@@ -352,6 +352,25 @@ Ensure you have the required dependencies:
 pip install torch torchaudio transformers librosa accelerate
 ```
 
+### Optional 48kHz Speech Tokenizer (output)
+
+VoiceDesign, VoiceClone, CustomVoice, VoiceClonePrompt, and Dialogue nodes expose a `speech_tokenizer` option:
+- `24kHz (default)` preserves current behavior and uses the tokenizer bundled with the selected main TTS model (or the stock `Qwen3-TTS-Tokenizer-12Hz` path). Existing workflows with no value selected keep this default.
+- `48kHz` uses `takuma104/Qwen3-TTS-Tokenizer-12Hz-48kHz` (third-party, Apache-2.0, base: `Qwen/Qwen3-TTS-Tokenizer-12Hz`). It is a decoder-only tokenizer: **24kHz input / 48kHz output**, same `qwen3_tts_tokenizer_12hz` model type and codebook interface. ComfyUI `AUDIO.sample_rate` will be `48000` when this option is used.
+
+The 48kHz tokenizer is **not** auto-downloaded and is **never** silently replaced by the 24kHz tokenizer. Place it in:
+```text
+ComfyUI/models/qwen-tts/Qwen3-TTS-Tokenizer-12Hz-48kHz/
+```
+or download it explicitly:
+```bash
+python download_models.py --with-48k-tokenizer
+# or
+python download_models.py --48k-tokenizer-only
+```
+
+If 48kHz is selected but the folder is missing, the node raises a clear error with the expected path and Hugging Face repo. Reference/speaker embedding audio remains 24kHz-oriented (encoder input path unchanged); only decoded output audio uses the selected tokenizer sample rate. Test 48kHz with your target mode/quantization before relying on it in production workflows.
+
 ### Model Directory Structure
 
 ComfyUI-Qwen-TTS-5x automatically searches for models in the following priority:
@@ -364,6 +383,7 @@ ComfyUI/
 │       ├── Qwen/Qwen3-TTS-12Hz-0.6B-Base/
 │       ├── Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign/
 │       ├── Qwen/Qwen3-TTS-Tokenizer-12Hz/
+│       ├── Qwen3-TTS-Tokenizer-12Hz-48kHz/   (optional 48kHz output)
 │       └── voices/ (Saved presets .wav/.qvp)
 ```
 

@@ -157,6 +157,7 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
 
     attn_implementation = kwargs.get("attn_implementation")
     load_speech_tokenizer = kwargs.get("load_speech_tokenizer", False)
+    speech_tokenizer_dir = kwargs.get("speech_tokenizer_dir")
     auto_convert = kwargs.get("auto_convert", False)
 
     # Resolve compute dtype from the `dtype` argument (bf16 default).
@@ -419,8 +420,15 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
 
     # --- 10. Speech tokenizer (needed for audio decoding in generate) ---
     if load_speech_tokenizer:
-        st_dir = os.path.join(source, "speech_tokenizer")
+        st_dir = speech_tokenizer_dir or os.path.join(source, "speech_tokenizer")
         if not os.path.isdir(st_dir):
+            if speech_tokenizer_dir:
+                raise RuntimeError(
+                    f"[Qwen3-TTS] int8-convrot: selected speech tokenizer directory not found at {st_dir}. "
+                    f"Place the tokenizer in models/qwen-tts/ (e.g. Qwen3-TTS-Tokenizer-12Hz-48kHz) "
+                    f"or download it with `python download_models.py --with-48k-tokenizer`. "
+                    f"24kHz is never used as a fallback when a non-default tokenizer is selected."
+                )
             raise RuntimeError(
                 f"[Qwen3-TTS] int8-convrot: speech_tokenizer directory not found at {st_dir}. "
                 f"generate_voice_design() requires it to decode audio codes to waveform. "
@@ -430,7 +438,10 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
             from qwen_tts import Qwen3TTSTokenizer
             speech_tokenizer = Qwen3TTSTokenizer.from_pretrained(st_dir, local_files_only=True)
             speech_tokenizer.model.to(device=device)
-            speech_tokenizer.device = torch.device(device)
+            try:
+                speech_tokenizer.device = torch.device(device)
+            except Exception:
+                pass
             model.load_speech_tokenizer(speech_tokenizer)
             try:
                 _codec_dev = next(speech_tokenizer.model.parameters()).device

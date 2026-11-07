@@ -5,8 +5,8 @@ import torch
 import numpy as np
 from typing import Dict, Any, List, Optional, Tuple, Union
 
-from .constants import DEMO_LANGUAGES, LANGUAGE_MAP, EMOTION_MAP, ATTENTION_OPTIONS, _MODEL_CACHE
-from .model import load_qwen_model, unload_cached_model
+from .constants import DEMO_LANGUAGES, LANGUAGE_MAP, EMOTION_MAP, ATTENTION_OPTIONS, SPEECH_TOKENIZER_CHOICES, _MODEL_CACHE
+from .model import load_qwen_model, unload_cached_model, get_model_output_sample_rate
 from .paths import _voices_dir, _safe_filename, _resolve_within, _register_safe_globals
 from .progress import TTSProgress, _emit_progress
 from .text import (
@@ -42,6 +42,7 @@ class VoiceDesignNode:
                 "temperature": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 2.0, "step": 0.1, "tooltip": "Sampling temperature"}),
                 "repetition_penalty": ("FLOAT", {"default": 1.05, "min": 1.0, "max": 2.0, "step": 0.05, "tooltip": "Penalty for repetition"}),
                 "attention": (ATTENTION_OPTIONS, {"default": "auto", "tooltip": "Attention implementation"}),
+                "speech_tokenizer": (SPEECH_TOKENIZER_CHOICES, {"default": "24kHz (default)", "tooltip": "Speech tokenizer/output sample rate. 24kHz uses the bundled tokenizer (default). 48kHz uses takuma104/Qwen3-TTS-Tokenizer-12Hz-48kHz from models/qwen-tts/ (decoder-only, 24kHz input/48kHz output; never auto-downloaded, never falls back to 24kHz)."}),
                 "unload_model_after_generate": ("BOOLEAN", {"default": False, "tooltip": "Unload model from memory after generation"}),
             }
         }
@@ -56,15 +57,15 @@ class VoiceDesignNode:
     def IS_CHANGED(cls, text, instruct, model_choice, device, precision,
                    quantization, language, seed, max_new_tokens, top_p,
                    top_k, temperature, repetition_penalty, attention,
-                   unload_model_after_generate=False, **kwargs):
+                   unload_model_after_generate=False, speech_tokenizer="24kHz (default)", **kwargs):
         return hashlib.sha256(
             f"{text}|{instruct}|{model_choice}|{device}|{precision}|"
             f"{quantization}|{language}|{seed}|{max_new_tokens}|{top_p}|"
-            f"{top_k}|{temperature}|{repetition_penalty}|{attention}".encode()
+            f"{top_k}|{temperature}|{repetition_penalty}|{attention}|{speech_tokenizer}".encode()
         ).hexdigest()
 
-    def generate(self, text: str, instruct: str, model_choice: str, device: str, precision: str, language: str, quantization: str = "none", seed: int = 0, max_new_tokens: int = 2048, top_p: float = 0.8, top_k: int = 20, temperature: float = 1.0, repetition_penalty: float = 1.05, attention: str = "auto", unload_model_after_generate: bool = False) -> Tuple[Dict[str, Any]]:
-        print(f"[Qwen3TTS] generate called: seed={seed}, model_choice={model_choice}")
+    def generate(self, text: str, instruct: str, model_choice: str, device: str, precision: str, language: str, quantization: str = "none", seed: int = 0, max_new_tokens: int = 2048, top_p: float = 0.8, top_k: int = 20, temperature: float = 1.0, repetition_penalty: float = 1.05, attention: str = "auto", unload_model_after_generate: bool = False, speech_tokenizer: str = "24kHz (default)") -> Tuple[Dict[str, Any]]:
+        print(f"[Qwen3TTS] generate called: seed={seed}, model_choice={model_choice}, speech_tokenizer={speech_tokenizer}")
         if not text or not instruct:
             raise RuntimeError("Text and instruction description are required")
 
@@ -78,7 +79,7 @@ class VoiceDesignNode:
 
         pbar.phase_loaded()
 
-        model = load_qwen_model("VoiceDesign", model_choice, device, precision, quantization, attention, unload_model_after_generate, previous_attention)
+        model = load_qwen_model("VoiceDesign", model_choice, device, precision, quantization, attention, unload_model_after_generate, previous_attention, speech_tokenizer=speech_tokenizer)
 
         torch.manual_seed(seed)
         if torch.cuda.is_available():
@@ -108,7 +109,7 @@ class VoiceDesignNode:
             )
             return wavs[0], seg_sr
 
-        audio_data = _render_segments(segments, render_design)
+        audio_data = _render_segments(segments, render_design, default_sr=get_model_output_sample_rate(model))
 
         pbar.phase_done()
         pbar.unregister()
@@ -147,6 +148,7 @@ class VoiceCloneNode:
                 "repetition_penalty": ("FLOAT", {"default": 1.05, "min": 1.0, "max": 2.0, "step": 0.05, "tooltip": "Penalty for repetition"}),
                 "x_vector_only": ("BOOLEAN", {"default": False}),
                 "attention": (ATTENTION_OPTIONS, {"default": "auto", "tooltip": "Attention implementation"}),
+                "speech_tokenizer": (SPEECH_TOKENIZER_CHOICES, {"default": "24kHz (default)", "tooltip": "Speech tokenizer/output sample rate. 24kHz uses the bundled tokenizer (default). 48kHz uses takuma104/Qwen3-TTS-Tokenizer-12Hz-48kHz from models/qwen-tts/ (decoder-only, 24kHz input/48kHz output; never auto-downloaded, never falls back to 24kHz)."}),
                 "unload_model_after_generate": ("BOOLEAN", {"default": False, "tooltip": "Unload model from memory after generation"}),
                 "custom_model_path": ("STRING", {
                     "default": "",
@@ -170,12 +172,12 @@ class VoiceCloneNode:
     def IS_CHANGED(cls, target_text, model_choice, device, precision,
                    language, quantization, ref_text, seed, max_new_tokens,
                    top_p, top_k, temperature, repetition_penalty,
-                   x_vector_only, attention, custom_model_path, **kwargs):
+                   x_vector_only, attention, custom_model_path, speech_tokenizer="24kHz (default)", **kwargs):
         return hashlib.sha256(
             f"{target_text}|{model_choice}|{device}|{precision}|"
             f"{language}|{quantization}|{ref_text}|{seed}|{max_new_tokens}|"
             f"{top_p}|{top_k}|{temperature}|{repetition_penalty}|"
-            f"{x_vector_only}|{attention}|{custom_model_path}".encode()
+            f"{x_vector_only}|{attention}|{custom_model_path}|{speech_tokenizer}".encode()
         ).hexdigest()
 
     def _audio_tensor_to_tuple(self, audio_tensor: Dict[str, Any]) -> Tuple[np.ndarray, int]:
@@ -266,7 +268,7 @@ class VoiceCloneNode:
                  max_new_tokens: int = 2048,
                  top_p: float = 0.8, top_k: int = 20, temperature: float = 1.0, repetition_penalty: float = 1.05,
                  x_vector_only: bool = False, attention: str = "auto",
-                 unload_model_after_generate: bool = False, custom_model_path: str = "") -> Tuple[Dict[str, Any]]:
+                 unload_model_after_generate: bool = False, custom_model_path: str = "", speech_tokenizer: str = "24kHz (default)") -> Tuple[Dict[str, Any]]:
         if ref_audio is None and voice_clone_prompt is None:
             raise RuntimeError("Either reference audio or voice clone prompt is required")
 
@@ -280,7 +282,7 @@ class VoiceCloneNode:
 
         pbar.phase_loaded()
 
-        model = load_qwen_model("Base", model_choice, device, precision, quantization, attention, unload_model_after_generate, previous_attention, custom_model_path)
+        model = load_qwen_model("Base", model_choice, device, precision, quantization, attention, unload_model_after_generate, previous_attention, custom_model_path, speech_tokenizer=speech_tokenizer)
 
         torch.manual_seed(seed)
         if torch.cuda.is_available():
@@ -329,7 +331,7 @@ class VoiceCloneNode:
                     )
                     return wavs[0], seg_sr
 
-                audio_data = _render_segments(segments, render_clone)
+                audio_data = _render_segments(segments, render_clone, default_sr=get_model_output_sample_rate(model))
 
             except Exception as e:
                 raise RuntimeError(f"Generation failed: {e}")
@@ -369,6 +371,7 @@ class CustomVoiceNode:
                 "temperature": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 2.0, "step": 0.1, "tooltip": "Sampling temperature"}),
                 "repetition_penalty": ("FLOAT", {"default": 1.05, "min": 1.0, "max": 2.0, "step": 0.05, "tooltip": "Penalty for repetition"}),
                 "attention": (ATTENTION_OPTIONS, {"default": "auto", "tooltip": "Attention implementation"}),
+                "speech_tokenizer": (SPEECH_TOKENIZER_CHOICES, {"default": "24kHz (default)", "tooltip": "Speech tokenizer/output sample rate. 24kHz uses the bundled tokenizer (default). 48kHz uses takuma104/Qwen3-TTS-Tokenizer-12Hz-48kHz from models/qwen-tts/ (decoder-only, 24kHz input/48kHz output; never auto-downloaded, never falls back to 24kHz)."}),
                 "unload_model_after_generate": ("BOOLEAN", {"default": False, "tooltip": "Unload model from memory after generation"}),
                 "custom_model_path": ("STRING", {
                     "default": "",
@@ -394,15 +397,15 @@ class CustomVoiceNode:
                    language, quantization, seed, instruct, max_new_tokens,
                    top_p, top_k, temperature, repetition_penalty,
                    attention, custom_model_path, custom_speaker_name,
-                   **kwargs):
+                   speech_tokenizer="24kHz (default)", **kwargs):
         return hashlib.sha256(
             f"{text}|{speaker}|{model_choice}|{device}|{precision}|"
             f"{language}|{quantization}|{seed}|{instruct}|{max_new_tokens}|"
             f"{top_p}|{top_k}|{temperature}|{repetition_penalty}|"
-            f"{attention}|{custom_model_path}|{custom_speaker_name}".encode()
+            f"{attention}|{custom_model_path}|{custom_speaker_name}|{speech_tokenizer}".encode()
         ).hexdigest()
 
-    def generate(self, text: str, speaker: str, model_choice: str, device: str, precision: str, language: str, quantization: str = "none", seed: int = 0, instruct: str = "", max_new_tokens: int = 2048, top_p: float = 0.8, top_k: int = 20, temperature: float = 1.0, repetition_penalty: float = 1.05, attention: str = "auto", unload_model_after_generate: bool = False, custom_model_path: str = "", custom_speaker_name: str = "") -> Tuple[Dict[str, Any]]:
+    def generate(self, text: str, speaker: str, model_choice: str, device: str, precision: str, language: str, quantization: str = "none", seed: int = 0, instruct: str = "", max_new_tokens: int = 2048, top_p: float = 0.8, top_k: int = 20, temperature: float = 1.0, repetition_penalty: float = 1.05, attention: str = "auto", unload_model_after_generate: bool = False, custom_model_path: str = "", custom_speaker_name: str = "", speech_tokenizer: str = "24kHz (default)") -> Tuple[Dict[str, Any]]:
         # Prefer custom_speaker_name if provided
         target_speaker = speaker
         if custom_speaker_name and custom_speaker_name.strip():
@@ -423,7 +426,7 @@ class CustomVoiceNode:
 
         pbar.phase_loaded()
 
-        model = load_qwen_model("CustomVoice", model_choice, device, precision, quantization, attention, unload_model_after_generate, previous_attention, custom_model_path)
+        model = load_qwen_model("CustomVoice", model_choice, device, precision, quantization, attention, unload_model_after_generate, previous_attention, custom_model_path, speech_tokenizer=speech_tokenizer)
 
         torch.manual_seed(seed)
         if torch.cuda.is_available():
@@ -454,7 +457,7 @@ class CustomVoiceNode:
             )
             return wavs[0], seg_sr
 
-        audio_data = _render_segments(segments, render_custom)
+        audio_data = _render_segments(segments, render_custom, default_sr=get_model_output_sample_rate(model))
 
         pbar.phase_done()
         pbar.unregister()
@@ -471,22 +474,27 @@ class VoiceClonePromptNode:
     """
 
     @classmethod
-    def INPUT_TYPES(cls) -> Dict[str, Any]:
+    def INPUT_TYPES(cls):
         return {
             "required": {
                 "ref_audio": ("AUDIO", {"tooltip": "Reference audio (ComfyUI Audio)"}),
-                "ref_text": ("STRING", {"multiline": True, "default": "", "placeholder": "Reference audio text (highly recommended for better quality)"}),
+                "ref_text": ("STRING", {"multiline": True, "default": "", "placeholder": "Reference audio text (optional)"}),
                 "model_choice": (["0.6B", "1.7B"], {"default": "0.6B"}),
-                "device": (["auto", "cuda", "mps", "cpu"], {"default": "auto"}),
+                "device": (["auto", "cuda","mps", "cpu"], {"default": "auto"}),
                 "precision": (["bf16", "fp32"], {"default": "bf16"}),
-                "quantization": (["none", "int8-convrot"], {"default": "none"}),
                 "attention": (ATTENTION_OPTIONS, {"default": "auto", "tooltip": "Attention implementation"}),
             },
             "optional": {
-                "x_vector_only": ("BOOLEAN", {"default": False, "tooltip": "If True, only speaker embedding is extracted (ref_text not needed)"}),
+                "quantization": (["none", "int8-convrot"], {"default": "none"}),
+                "x_vector_only": ("BOOLEAN", {"default": False}),
+                "speech_tokenizer": (SPEECH_TOKENIZER_CHOICES, {"default": "24kHz (default)", "tooltip": "Speech tokenizer/output sample rate for prompt context. 24kHz uses the bundled tokenizer (default). 48kHz uses takuma104/Qwen3-TTS-Tokenizer-12Hz-48kHz from models/qwen-tts/ (decoder-only, 24kHz input/48kHz output; never auto-downloaded, never falls back to 24kHz)."}),
                 "unload_model_after_generate": ("BOOLEAN", {"default": False, "tooltip": "Unload model from memory after generation"}),
             }
         }
+
+    @classmethod
+    def IS_CHANGED(cls, ref_text, model_choice, device, precision, attention, quantization="none", x_vector_only=False, speech_tokenizer="24kHz (default)", **kwargs):
+        return hashlib.sha256(f"{ref_text}|{model_choice}|{device}|{precision}|{attention}|{quantization}|{x_vector_only}|{speech_tokenizer}".encode()).hexdigest()
 
     RETURN_TYPES = ("VOICE_CLONE_PROMPT",)
     RETURN_NAMES = ("voice_clone_prompt",)
@@ -494,7 +502,7 @@ class VoiceClonePromptNode:
     CATEGORY = "Qwen3-TTS"
     DESCRIPTION = "VoiceClonePrompt: Extract and cache voice features for reuse in VoiceClone node."
 
-    def create_prompt(self, ref_audio: Dict[str, Any], ref_text: str, model_choice: str, device: str, precision: str, attention: str, quantization: str = "none", x_vector_only: bool = False, unload_model_after_generate: bool = False) -> Tuple[Any]:
+    def create_prompt(self, ref_audio: Dict[str, Any], ref_text: str, model_choice: str, device: str, precision: str, attention: str, quantization: str = "none", x_vector_only: bool = False, unload_model_after_generate: bool = False, speech_tokenizer: str = "24kHz (default)") -> Tuple[Any]:
         if ref_audio is None:
             raise RuntimeError("Reference audio is required")
 
@@ -510,7 +518,7 @@ class VoiceClonePromptNode:
 
         pbar.phase_loaded()
 
-        model = load_qwen_model("Base", model_choice, device, precision, quantization, attention, unload_model_after_generate, previous_attention)
+        model = load_qwen_model("Base", model_choice, device, precision, quantization, attention, unload_model_after_generate, previous_attention, speech_tokenizer=speech_tokenizer)
 
         pbar.phase_loaded()
 
@@ -619,16 +627,16 @@ class DialogueInferenceNode:
                    pause_linebreak, period_pause, comma_pause, question_pause,
                    hyphen_pause, merge_outputs, batch_size, quantization,
                    seed, max_new_tokens_per_line, top_p, top_k, temperature,
-                   repetition_penalty, attention, **kwargs):
+                   repetition_penalty, attention, speech_tokenizer="24kHz (default)", **kwargs):
         return hashlib.sha256(
             f"{script}|{model_choice}|{device}|{precision}|{language}|"
             f"{pause_linebreak}|{period_pause}|{comma_pause}|{question_pause}|"
             f"{hyphen_pause}|{merge_outputs}|{batch_size}|{quantization}|"
             f"{seed}|{max_new_tokens_per_line}|{top_p}|{top_k}|{temperature}|"
-            f"{repetition_penalty}|{attention}".encode()
+            f"{repetition_penalty}|{attention}|{speech_tokenizer}".encode()
         ).hexdigest()
 
-    def generate_dialogue(self, script: str, role_bank: Dict[str, Any], model_choice: str, device: str, precision: str, language: str, pause_linebreak: float, period_pause: float, comma_pause: float, question_pause: float, hyphen_pause: float, merge_outputs: bool, batch_size: int, quantization: str = "none", seed: int = 0, max_new_tokens_per_line: int = 2048, top_p: float = 0.8, top_k: int = 20, temperature: float = 1.0, repetition_penalty: float = 1.05, attention: str = "auto", unload_model_after_generate: bool = False) -> Tuple[Dict[str, Any]]:
+    def generate_dialogue(self, script: str, role_bank: Dict[str, Any], model_choice: str, device: str, precision: str, language: str, pause_linebreak: float, period_pause: float, comma_pause: float, question_pause: float, hyphen_pause: float, merge_outputs: bool, batch_size: int, quantization: str = "none", seed: int = 0, max_new_tokens_per_line: int = 2048, top_p: float = 0.8, top_k: int = 20, temperature: float = 1.0, repetition_penalty: float = 1.05, attention: str = "auto", unload_model_after_generate: bool = False, speech_tokenizer: str = "24kHz (default)") -> Tuple[Dict[str, Any]]:
         if not script or not role_bank:
             raise RuntimeError("Script and Role Bank are required")
 
@@ -638,7 +646,7 @@ class DialogueInferenceNode:
                 previous_attention = key[5] if len(key) > 5 else None
                 break
 
-        model = load_qwen_model("Base", model_choice, device, precision, quantization, attention, unload_model_after_generate, previous_attention)
+        model = load_qwen_model("Base", model_choice, device, precision, quantization, attention, unload_model_after_generate, previous_attention, speech_tokenizer=speech_tokenizer)
 
         torch.manual_seed(seed)
         if torch.cuda.is_available():
@@ -738,7 +746,7 @@ class DialogueInferenceNode:
 
         try:
             results = []
-            sr = 24000
+            sr = get_model_output_sample_rate(model)
 
             for i in range(0, num_lines, batch_size):
                 chunk_texts = texts_to_gen[i:i + batch_size]
