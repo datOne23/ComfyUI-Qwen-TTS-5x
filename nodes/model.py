@@ -229,39 +229,83 @@ def check_and_download_tokenizer():
 
 
 def get_qwen_models_root() -> str:
-    qwen_root = os.path.join(MODELS_DIR, "qwen-tts")
-    os.makedirs(qwen_root, exist_ok=True)
-    return qwen_root
+    """Primary writable qwen-tts model directory.
+
+    Uses ComfyUI's configured models directory (folder_paths) so tokenizers,
+    downloaded models, and int8 caches land in ComfyUI/models/qwen-tts rather
+    than under custom_nodes/ when the plugin is installed as a custom node.
+    Falls back to the boot-derived MODELS_DIR for unusual layouts.
+    """
+    candidates = []
+    try:
+        import folder_paths
+        candidates.append(os.path.join(folder_paths.models_dir, "qwen-tts"))
+    except Exception:
+        pass
+    candidates.append(os.path.join(MODELS_DIR, "qwen-tts"))
+    for root in candidates:
+        try:
+            if os.path.isdir(root):
+                return root
+        except Exception:
+            pass
+    target = candidates[0]
+    os.makedirs(target, exist_ok=True)
+    return target
 
 
 def resolve_speech_tokenizer_dir(speech_tokenizer: str, qwen_root: Optional[str] = None) -> Optional[str]:
     """Resolve an optional speech tokenizer directory.
 
     Returns None for the 24kHz default, meaning "use the model-bundled tokenizer"
-    and preserve the exact existing load path. For non-default choices, returns a
-    validated tokenizer directory or raises a clear RuntimeError if missing.
+    and preserve the exact existing load path. For non-default choices, searches
+    ComfyUI qwen-tts model roots for a validated tokenizer directory and raises a
+    clear RuntimeError if missing.
     """
     choice = speech_tokenizer or "24kHz (default)"
     if choice in ("24kHz (default)", "24kHz", "Qwen3-TTS-Tokenizer-12Hz"):
         check_and_download_tokenizer()
         return None
 
-    root = qwen_root or get_qwen_models_root()
     folder = constants.SPEECH_TOKENIZER_FOLDERS.get(choice)
     repo = constants.SPEECH_TOKENIZER_REPOS.get(choice)
     if not folder:
         folder = str(choice)
         repo = repo or (f"takuma104/{folder}" if "48kHz" in folder else folder)
 
-    target_dir = os.path.join(root, folder)
-    cfg_path = os.path.join(target_dir, "config.json")
-    if os.path.isdir(target_dir) and os.path.isfile(cfg_path):
-        return target_dir
+    # Search the same ComfyUI model roots used for other Qwen3-TTS assets.
+    # This finds tokenizers placed in ComfyUI/models/qwen-tts even when a legacy
+    # boot-derived root (custom_nodes/models) is passed or configured.
+    search_roots = list(_model_search_roots())
+    if qwen_root:
+        try:
+            qr = os.path.realpath(qwen_root)
+        except Exception:
+            qr = qwen_root
+        if qr not in search_roots:
+            search_roots.insert(0, qr)
+    primary_root = qwen_root or get_qwen_models_root()
+    try:
+        pr = os.path.realpath(primary_root)
+    except Exception:
+        pr = primary_root
+    if pr not in search_roots:
+        search_roots.insert(0, pr)
+
+    checked = []
+    for root in search_roots:
+        target_dir = os.path.join(root, folder)
+        checked.append(target_dir)
+        cfg_path = os.path.join(target_dir, "config.json")
+        if os.path.isdir(target_dir) and os.path.isfile(cfg_path):
+            return target_dir
 
     repo_hint = f" Hugging Face repo: {repo}." if repo else ""
+    expected = os.path.join(primary_root, folder)
     raise RuntimeError(
         f"Speech tokenizer '{choice}' is not installed. "
-        f"Expected folder: {target_dir} (must contain config.json and model weights).{repo_hint} "
+        f"Expected folder: {expected} (must contain config.json and model weights).{repo_hint} "
+        f"Searched: {'; '.join(dict.fromkeys(checked))}. "
         f"Download it manually or run `python download_models.py --with-48k-tokenizer`. "
         f"The 48kHz tokenizer is a third-party Apache-2.0 fine-tune (base: Qwen/Qwen3-TTS-Tokenizer-12Hz) "
         f"with 24kHz input and 48kHz output; it is never auto-downloaded and 24kHz is never used as a fallback."
