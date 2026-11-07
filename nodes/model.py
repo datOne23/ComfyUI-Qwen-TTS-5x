@@ -387,10 +387,26 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
             load_kwargs["attn_implementation"] = attn_param
         print(f"🔧 [Qwen3-TTS] Loading model with attention: {attn_impl}")
         model = Qwen3TTSModel.from_pretrained(final_source, **load_kwargs)
-        if hasattr(model, 'speech_tokenizer') and model.speech_tokenizer is not None:
-            model.speech_tokenizer.model.to(device=device)
-            model.speech_tokenizer.device = torch.device(device)
-            print(f"✅ [Qwen3-TTS] codec moved to {next(model.speech_tokenizer.model.parameters()).device}")
+        # Speech tokenizer lives on the inner HF model (wrap.model), not the wrapper
+        _inner = getattr(model, 'model', None)
+        _st = getattr(_inner, 'speech_tokenizer', None) if _inner is not None else None
+        if _st is not None:
+            _st.model.to(device=device)
+            try:
+                _codec_dev = next(_st.model.parameters()).device
+            except StopIteration:
+                _codec_dev = "unknown"
+            print(f"✅ [Qwen3-TTS] codec moved to {_codec_dev}")
+            # Cast codec dtype to match compute dtype
+            try:
+                _first = next(_st.model.parameters())
+                if _first.dtype != dtype and _first.is_floating_point():
+                    _st.model = _st.model.to(dtype)
+                    print(f"🔧 [Qwen3-TTS] codec cast {_first.dtype} -> {dtype}")
+            except StopIteration:
+                pass
+        else:
+            print("⚠️ [Qwen3-TTS] codec move skipped — speech tokenizer not found on bf16 model")
 
     # Apply patches
     apply_qwen3_patches(model)

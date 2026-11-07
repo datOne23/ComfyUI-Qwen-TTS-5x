@@ -432,7 +432,19 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
             speech_tokenizer.model.to(device=device)
             speech_tokenizer.device = torch.device(device)
             model.load_speech_tokenizer(speech_tokenizer)
-            print(f"✅ [Qwen3-TTS] codec moved to {next(speech_tokenizer.model.parameters()).device}")
+            try:
+                _codec_dev = next(speech_tokenizer.model.parameters()).device
+            except StopIteration:
+                _codec_dev = "unknown"
+            print(f"✅ [Qwen3-TTS] codec moved to {_codec_dev}")
+            # Cast codec dtype to match compute dtype
+            try:
+                _first = next(speech_tokenizer.model.parameters())
+                if _first.dtype != dtype and _first.is_floating_point():
+                    speech_tokenizer.model = speech_tokenizer.model.to(dtype)
+                    print(f"🔧 [Qwen3-TTS] codec cast {_first.dtype} -> {dtype}")
+            except StopIteration:
+                pass
             print(f"✅ [Qwen3-TTS] int8-convrot: speech tokenizer loaded from {st_dir}")
         except Exception as e:
             raise RuntimeError(
