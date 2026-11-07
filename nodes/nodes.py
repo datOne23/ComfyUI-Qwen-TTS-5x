@@ -57,7 +57,6 @@ class VoiceDesignNode:
                    quantization, language, seed, max_new_tokens, top_p,
                    top_k, temperature, repetition_penalty, attention,
                    unload_model_after_generate=False, **kwargs):
-        import hashlib
         return hashlib.sha256(
             f"{text}|{instruct}|{model_choice}|{device}|{precision}|"
             f"{quantization}|{language}|{seed}|{max_new_tokens}|{top_p}|"

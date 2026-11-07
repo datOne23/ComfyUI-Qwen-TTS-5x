@@ -440,9 +440,9 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
             # Cast codec dtype to match compute dtype
             try:
                 _first = next(speech_tokenizer.model.parameters())
-                if _first.dtype != dtype and _first.is_floating_point():
-                    speech_tokenizer.model = speech_tokenizer.model.to(dtype)
-                    print(f"🔧 [Qwen3-TTS] codec cast {_first.dtype} -> {dtype}")
+                if _first.dtype != out_dtype and _first.is_floating_point():
+                    speech_tokenizer.model = speech_tokenizer.model.to(out_dtype)
+                    print(f"🔧 [Qwen3-TTS] codec cast {_first.dtype} -> {out_dtype}")
             except StopIteration:
                 pass
             print(f"✅ [Qwen3-TTS] int8-convrot: speech tokenizer loaded from {st_dir}")

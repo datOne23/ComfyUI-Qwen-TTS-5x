@@ -393,6 +393,10 @@ def load_qwen_model(model_type: str, model_choice: str, device: str, precision: 
         if _st is not None:
             _st.model.to(device=device)
             try:
+                _st.device = torch.device(device)
+            except AttributeError:
+                print("[Qwen3-TTS] speech_tokenizer.device not settable; relies on device_map")
+            try:
                 _codec_dev = next(_st.model.parameters()).device
             except StopIteration:
                 _codec_dev = "unknown"
