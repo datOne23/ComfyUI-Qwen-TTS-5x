@@ -42,7 +42,7 @@ class VoiceDesignNode:
                 "temperature": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 2.0, "step": 0.1, "tooltip": "Sampling temperature"}),
                 "repetition_penalty": ("FLOAT", {"default": 1.05, "min": 1.0, "max": 2.0, "step": 0.05, "tooltip": "Penalty for repetition"}),
                 "attention": (ATTENTION_OPTIONS, {"default": "auto", "tooltip": "Attention implementation"}),
-                "speech_tokenizer": (SPEECH_TOKENIZER_CHOICES, {"default": "24kHz (default)", "tooltip": "Speech tokenizer/output sample rate. 24kHz uses the bundled tokenizer (default). 48kHz uses takuma104/Qwen3-TTS-Tokenizer-12Hz-48kHz from models/qwen-tts/ (decoder-only, 24kHz input/48kHz output; never auto-downloaded, never falls back to 24kHz)."}),
+                "speech_tokenizer": (SPEECH_TOKENIZER_CHOICES, {"default": "24kHz (default)", "tooltip": "Speech tokenizer/output sample rate. 24kHz uses the bundled tokenizer (default). 48kHz uses takuma104/Qwen3-TTS-Tokenizer-12Hz-48kHz from models/qwen-tts/ (auto-downloaded when selected if missing; decoder-only, 24kHz input/48kHz output; never falls back to 24kHz)."}),
                 "unload_model_after_generate": ("BOOLEAN", {"default": False, "tooltip": "Unload model from memory after generation"}),
             }
         }
@@ -148,7 +148,7 @@ class VoiceCloneNode:
                 "repetition_penalty": ("FLOAT", {"default": 1.05, "min": 1.0, "max": 2.0, "step": 0.05, "tooltip": "Penalty for repetition"}),
                 "x_vector_only": ("BOOLEAN", {"default": False}),
                 "attention": (ATTENTION_OPTIONS, {"default": "auto", "tooltip": "Attention implementation"}),
-                "speech_tokenizer": (SPEECH_TOKENIZER_CHOICES, {"default": "24kHz (default)", "tooltip": "Speech tokenizer/output sample rate. 24kHz uses the bundled tokenizer (default). 48kHz uses takuma104/Qwen3-TTS-Tokenizer-12Hz-48kHz from models/qwen-tts/ (decoder-only, 24kHz input/48kHz output; never auto-downloaded, never falls back to 24kHz)."}),
+                "speech_tokenizer": (SPEECH_TOKENIZER_CHOICES, {"default": "24kHz (default)", "tooltip": "Speech tokenizer/output sample rate. 24kHz uses the bundled tokenizer (default). 48kHz uses takuma104/Qwen3-TTS-Tokenizer-12Hz-48kHz from models/qwen-tts/ (auto-downloaded when selected if missing; decoder-only, 24kHz input/48kHz output; never falls back to 24kHz)."}),
                 "unload_model_after_generate": ("BOOLEAN", {"default": False, "tooltip": "Unload model from memory after generation"}),
                 "custom_model_path": ("STRING", {
                     "default": "",
@@ -371,7 +371,7 @@ class CustomVoiceNode:
                 "temperature": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 2.0, "step": 0.1, "tooltip": "Sampling temperature"}),
                 "repetition_penalty": ("FLOAT", {"default": 1.05, "min": 1.0, "max": 2.0, "step": 0.05, "tooltip": "Penalty for repetition"}),
                 "attention": (ATTENTION_OPTIONS, {"default": "auto", "tooltip": "Attention implementation"}),
-                "speech_tokenizer": (SPEECH_TOKENIZER_CHOICES, {"default": "24kHz (default)", "tooltip": "Speech tokenizer/output sample rate. 24kHz uses the bundled tokenizer (default). 48kHz uses takuma104/Qwen3-TTS-Tokenizer-12Hz-48kHz from models/qwen-tts/ (decoder-only, 24kHz input/48kHz output; never auto-downloaded, never falls back to 24kHz)."}),
+                "speech_tokenizer": (SPEECH_TOKENIZER_CHOICES, {"default": "24kHz (default)", "tooltip": "Speech tokenizer/output sample rate. 24kHz uses the bundled tokenizer (default). 48kHz uses takuma104/Qwen3-TTS-Tokenizer-12Hz-48kHz from models/qwen-tts/ (auto-downloaded when selected if missing; decoder-only, 24kHz input/48kHz output; never falls back to 24kHz)."}),
                 "unload_model_after_generate": ("BOOLEAN", {"default": False, "tooltip": "Unload model from memory after generation"}),
                 "custom_model_path": ("STRING", {
                     "default": "",
@@ -487,7 +487,7 @@ class VoiceClonePromptNode:
             "optional": {
                 "quantization": (["none", "int8-convrot"], {"default": "none"}),
                 "x_vector_only": ("BOOLEAN", {"default": False}),
-                "speech_tokenizer": (SPEECH_TOKENIZER_CHOICES, {"default": "24kHz (default)", "tooltip": "Speech tokenizer/output sample rate for prompt context. 24kHz uses the bundled tokenizer (default). 48kHz uses takuma104/Qwen3-TTS-Tokenizer-12Hz-48kHz from models/qwen-tts/ (decoder-only, 24kHz input/48kHz output; never auto-downloaded, never falls back to 24kHz)."}),
+                "speech_tokenizer": (SPEECH_TOKENIZER_CHOICES, {"default": "24kHz (default)", "tooltip": "Speech tokenizer/output sample rate for prompt context. 24kHz uses the bundled tokenizer (default). 48kHz uses takuma104/Qwen3-TTS-Tokenizer-12Hz-48kHz from models/qwen-tts/ (auto-downloaded when selected if missing; decoder-only, 24kHz input/48kHz output; never falls back to 24kHz)."}),
                 "unload_model_after_generate": ("BOOLEAN", {"default": False, "tooltip": "Unload model from memory after generation"}),
             }
         }

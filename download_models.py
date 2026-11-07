@@ -64,7 +64,7 @@ def main():
     parser.add_argument("--target", type=str, help="Specific target directory for models. Defaults to ComfyUI/models/qwen-tts if found, else ./models/qwen-tts")
     parser.add_argument("--small", action="store_true", help="Download 0.6B models instead of 1.7B (where available)")
     parser.add_argument("--all", action="store_true", help="Download ALL models (0.6B and 1.7B), plus optional tokenizer if --with-48k-tokenizer is set")
-    parser.add_argument("--with-48k-tokenizer", action="store_true", help="Also download optional 48kHz speech tokenizer (takuma104/Qwen3-TTS-Tokenizer-12Hz-48kHz, third-party Apache-2.0). Not auto-downloaded by default.")
+    parser.add_argument("--with-48k-tokenizer", action="store_true", help="Also download optional 48kHz speech tokenizer (takuma104/Qwen3-TTS-Tokenizer-12Hz-48kHz, third-party Apache-2.0). Auto-downloaded by nodes when selected; this flag pre-downloads it.")
     parser.add_argument("--48k-tokenizer-only", action="store_true", help="Download only the optional 48kHz speech tokenizer")
     args = parser.parse_args()
 

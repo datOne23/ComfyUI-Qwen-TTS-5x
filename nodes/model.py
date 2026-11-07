@@ -254,13 +254,24 @@ def get_qwen_models_root() -> str:
     return target
 
 
+def _speech_tokenizer_weights_present(target_dir: str) -> bool:
+    try:
+        for name in os.listdir(target_dir):
+            if name.endswith(".safetensors") or name.endswith(".bin") or name.endswith(".pt"):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def resolve_speech_tokenizer_dir(speech_tokenizer: str, qwen_root: Optional[str] = None) -> Optional[str]:
     """Resolve an optional speech tokenizer directory.
 
     Returns None for the 24kHz default, meaning "use the model-bundled tokenizer"
     and preserve the exact existing load path. For non-default choices, searches
-    ComfyUI qwen-tts model roots for a validated tokenizer directory and raises a
-    clear RuntimeError if missing.
+    ComfyUI qwen-tts model roots for a validated tokenizer directory. If 48kHz is
+    selected and not found, attempts auto-download into the primary qwen-tts root.
+    Raises a clear RuntimeError if missing/invalid; never falls back to 24kHz.
     """
     choice = speech_tokenizer or "24kHz (default)"
     if choice in ("24kHz (default)", "24kHz", "Qwen3-TTS-Tokenizer-12Hz"):
@@ -292,13 +303,48 @@ def resolve_speech_tokenizer_dir(speech_tokenizer: str, qwen_root: Optional[str]
     if pr not in search_roots:
         search_roots.insert(0, pr)
 
+    def _validated(target_dir: str) -> bool:
+        return os.path.isdir(target_dir) and os.path.isfile(os.path.join(target_dir, "config.json")) and _speech_tokenizer_weights_present(target_dir)
+
     checked = []
     for root in search_roots:
         target_dir = os.path.join(root, folder)
         checked.append(target_dir)
-        cfg_path = os.path.join(target_dir, "config.json")
-        if os.path.isdir(target_dir) and os.path.isfile(cfg_path):
+        if _validated(target_dir):
             return target_dir
+
+    # 48kHz: auto-download to primary qwen-tts root when not found.
+    if "48kHz" in choice or "48kHz" in folder:
+        dl_root = get_qwen_models_root()
+        expected = os.path.join(dl_root, folder)
+        repo_id = repo or f"takuma104/{folder}"
+        print(
+            f"\n[Qwen3-TTS] 48kHz speech tokenizer not found; attempting auto-download.\n"
+            f"  Model: third-party fine-tune (Apache-2.0), base Qwen/Qwen3-TTS-Tokenizer-12Hz\n"
+            f"  Repo:  {repo_id}\n"
+            f"  Size:  ~578 MB (24kHz input / 48kHz output)\n"
+            f"  Dest:  {expected}\n"
+            f"  Note:  honors HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE/network availability; never falls back to 24kHz.\n"
+        )
+        result = download_model_if_needed(repo_id, dl_root)
+        if result and _validated(result):
+            return result
+        # Re-check searched roots in case download landed elsewhere.
+        checked = []
+        for root in search_roots:
+            target_dir = os.path.join(root, folder)
+            checked.append(target_dir)
+            if _validated(target_dir):
+                return target_dir
+        checked.append(expected)
+        raise RuntimeError(
+            f"Speech tokenizer '{choice}' (48kHz) could not be downloaded or is incomplete. "
+            f"Target: {expected} (must contain config.json and model weights). Hugging Face repo: {repo_id}. "
+            f"Searched: {'; '.join(dict.fromkeys(checked))}. "
+            f"If offline, download manually or run `python download_models.py --with-48k-tokenizer`. "
+            f"The 48kHz tokenizer is a third-party Apache-2.0 fine-tune (base: Qwen/Qwen3-TTS-Tokenizer-12Hz) "
+            f"with 24kHz input and 48kHz output; 24kHz is never used as a fallback."
+        )
 
     repo_hint = f" Hugging Face repo: {repo}." if repo else ""
     expected = os.path.join(primary_root, folder)
@@ -306,9 +352,7 @@ def resolve_speech_tokenizer_dir(speech_tokenizer: str, qwen_root: Optional[str]
         f"Speech tokenizer '{choice}' is not installed. "
         f"Expected folder: {expected} (must contain config.json and model weights).{repo_hint} "
         f"Searched: {'; '.join(dict.fromkeys(checked))}. "
-        f"Download it manually or run `python download_models.py --with-48k-tokenizer`. "
-        f"The 48kHz tokenizer is a third-party Apache-2.0 fine-tune (base: Qwen/Qwen3-TTS-Tokenizer-12Hz) "
-        f"with 24kHz input and 48kHz output; it is never auto-downloaded and 24kHz is never used as a fallback."
+        f"24kHz is never used as a fallback."
     )
 
 
