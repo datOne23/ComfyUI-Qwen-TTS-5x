@@ -51,9 +51,48 @@ from ._boot import (
 )
 from .progress import TTSProgress
 
-CONVERTER_SCRIPT = os.path.join(COMFY_ROOT, "custom_nodes", "comfy-model-tools", "quant_int8_convrot.py")
 INT8_CONVROT_EXCLUDE = ("codec_encoder|codec_decoder|speaker_encoder|vocoder|"
                         "seanet|audio_codec|feature_projection|output_proj|lm_head")
+
+
+def _resolve_converter_script():
+    """Find quant_int8_convrot.py across ComfyUI/portable and dev layouts.
+
+    _boot.COMFY_ROOT is dirname(PACKAGE_ROOT): in an installed plugin that is
+    the custom_nodes directory (so the converter is a sibling custom node),
+    while in some dev layouts it may be the ComfyUI base or working folder.
+    Check all plausible locations instead of assuming one root shape.
+    """
+    candidates = []
+    try:
+        from ._boot import PACKAGE_ROOT
+    except Exception:
+        PACKAGE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    roots = [COMFY_ROOT, os.path.dirname(COMFY_ROOT), PACKAGE_ROOT]
+    try:
+        import folder_paths
+        base = os.path.dirname(os.path.abspath(folder_paths.__file__))
+        roots.extend([base, os.path.join(base, "custom_nodes")])
+    except Exception:
+        pass
+    seen = set()
+    for root in roots:
+        if not root:
+            continue
+        norm = os.path.normpath(root)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        # sibling custom node (COMFY_ROOT==custom_nodes) or under custom_nodes
+        candidates.append(os.path.join(norm, "comfy-model-tools", "quant_int8_convrot.py"))
+        candidates.append(os.path.join(norm, "custom_nodes", "comfy-model-tools", "quant_int8_convrot.py"))
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+CONVERTER_SCRIPT = _resolve_converter_script()
 
 # Hadamard matrices cached by (groupsize, device, dtype) so we never rebuild
 # the same matrix twice during a load.
@@ -188,14 +227,39 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
                 f"and auto_convert is disabled."
             )
         # --- 2. Auto-convert on first load -------------------------------------
+        conv_source = _resolve_model_source(source)
+        converter = _resolve_converter_script()
+        if not converter:
+            roots = [COMFY_ROOT, os.path.dirname(COMFY_ROOT)]
+            try:
+                from ._boot import PACKAGE_ROOT
+                roots.append(PACKAGE_ROOT)
+            except Exception:
+                pass
+            try:
+                import folder_paths
+                base = os.path.dirname(os.path.abspath(folder_paths.__file__))
+                roots.extend([base, os.path.join(base, "custom_nodes")])
+            except Exception:
+                pass
+            searched = []
+            for r in roots:
+                if r:
+                    n = os.path.normpath(r)
+                    searched.append(os.path.join(n, "comfy-model-tools", "quant_int8_convrot.py"))
+                    searched.append(os.path.join(n, "custom_nodes", "comfy-model-tools", "quant_int8_convrot.py"))
+            raise FileNotFoundError(
+                "int8-convrot converter (quant_int8_convrot.py) not found. "
+                "Install/clone comfy-model-tools as a custom node (ComfyUI/custom_nodes/comfy-model-tools/) "
+                "or place quant_int8_convrot.py where this plugin can find it. Searched: "
+                + "; ".join(dict.fromkeys(searched))
+            )
         print(f"🔧 [Qwen3-TTS] int8-convrot: no saved weights found at {int8_convrot_path}; "
               f"running one-time conversion...")
 
-        conv_source = _resolve_model_source(source)
-
         # Validate with --dry-run first
         dry_run_cmd = [
-            sys.executable, CONVERTER_SCRIPT, conv_source, int8_convrot_path,
+            sys.executable, converter, conv_source, int8_convrot_path,
             "--dry-run",
             "--exclude", INT8_CONVROT_EXCLUDE,
             "--min-gemm", "256",
@@ -214,13 +278,13 @@ def load_int8_convrot_model(source, int8_convrot_path, device, dtype, **kwargs):
             raise RuntimeError("int8-convrot dry-run timed out (>10 min).")
         except FileNotFoundError:
             raise RuntimeError(
-                f"int8-convrot converter not found at {CONVERTER_SCRIPT}. "
-                f"Ensure comfy-model-tools is cloned alongside this plugin."
+                f"int8-convrot converter not found at {converter}. "
+                f"Ensure comfy-model-tools is installed (ComfyUI/custom_nodes/comfy-model-tools/)."
             )
 
         # Full conversion
         convert_cmd = [
-            sys.executable, CONVERTER_SCRIPT, conv_source, int8_convrot_path,
+            sys.executable, converter, conv_source, int8_convrot_path,
             "--exclude", INT8_CONVROT_EXCLUDE,
             "--min-gemm", "256",
             "--mseclip",
